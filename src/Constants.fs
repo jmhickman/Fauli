@@ -1,9 +1,3 @@
-/// Shared constants used across the library.
-///
-/// Rules for inclusion:
-///   1) The constant's name must have explanatory power — it clarifies the magic value's meaning.
-///   2) The constant must appear at least twice in the codebase. Single-use literals are
-///      embedded inline with a comment instead.
 module internal Fauli.Constants
 
 // ---------------------------------------------------------------------------
