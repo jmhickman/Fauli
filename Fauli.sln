@@ -1,0 +1,29 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{F2A71F9B-5D33-465A-A702-920D77279786}") = "Fauli", "Fauli.fsproj", "{33857355-604A-450C-ABB3-9AE382329E05}"
+EndProject
+Project("{F2A71F9B-5D33-465A-A702-920D77279786}") = "Fauli.Tests", "tests\Fauli.Tests\Fauli.Tests.fsproj", "{7757E2C5-18BF-443B-9A5E-1673F81EAD0D}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{33857355-604A-450C-ABB3-9AE382329E05}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{33857355-604A-450C-ABB3-9AE382329E05}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{33857355-604A-450C-ABB3-9AE382329E05}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{33857355-604A-450C-ABB3-9AE382329E05}.Release|Any CPU.Build.0 = Release|Any CPU
+		{7757E2C5-18BF-443B-9A5E-1673F81EAD0D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7757E2C5-18BF-443B-9A5E-1673F81EAD0D}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7757E2C5-18BF-443B-9A5E-1673F81EAD0D}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7757E2C5-18BF-443B-9A5E-1673F81EAD0D}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	EndGlobalSection
+EndGlobal

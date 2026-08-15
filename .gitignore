@@ -1,0 +1,13 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+.vs/
+## Research / design docs
+.fake
+analysis/
+## OS
+Thumbs.db
+.DS_Store

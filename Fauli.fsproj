@@ -1,0 +1,58 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IsAotCompatible>false</IsAotCompatible>
+
+    <!-- Warnings -->
+    <WarningsAsErrors>warning;$(WarningsAsErrors)</WarningsAsErrors>
+    <NoWarn>$(NoWarn);FS0025</NoWarn>
+
+    <!-- Packaging metadata for NuGet (local or published) -->
+    <PackageId>Fauli</PackageId>
+    <Version>2026.8.14</Version>
+    <Authors>jmhickman</Authors>
+    <Description>Authentication solver for Active Directory environments. Given credentials, a target host, and a protocol (SMB, LDAP, etc.), Fauli selects the best authentication method (Kerberos, NetNTLMv2, certificate, etc.) and produces an authenticated connection handle.</Description>
+    <PackageTags>kerberos;ntlm;smb;ldap;authentication;active-directory</PackageTags>
+
+    <PackageProjectUrl>https://github.com/jmhickman/fauli</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/jmhickman/fauli</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+
+    <!-- Include debug symbols as a separate .snupkg -->
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="src/AssemblyInfo.fs" />
+    <Compile Include="src/Constants.fs" />
+    <Compile Include="src/Domain.fs" />
+    <Compile Include="src/MethodSelection.fs" />
+    <Compile Include="src/ServiceDiscovery.fs" />
+    <Compile Include="src/Kerberos/Encoding.fs" />
+    <Compile Include="src/Kerberos/Parsing.fs" />
+    <Compile Include="src/Kerberos/Encryption.fs" />
+    <Compile Include="src/Kerberos/Auth.fs" />
+    <Compile Include="src/Kerberos/TicketIngestion.fs" />
+    <Compile Include="src/GssApi.fs" />
+    <Compile Include="src/Ntlm/Encoding.fs" />
+    <Compile Include="src/Ntlm/Crypto.fs" />
+    <Compile Include="src/Ntlm/Auth.fs" />
+    <Compile Include="src/Smb/Signing.fs" />
+    <Compile Include="src/Smb/Encryption.fs" />
+    <Compile Include="src/Smb/Handler.fs" />
+    <Compile Include="src/Ldap/Handler.fs" />
+    <Compile Include="src/Solver.fs" />
+
+    <None Include="README.md">
+      <Pack>true</Pack>
+      <PackagePath>/</PackagePath>
+    </None>
+  </ItemGroup>
+
+</Project>
