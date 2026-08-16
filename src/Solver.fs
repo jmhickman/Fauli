@@ -383,10 +383,11 @@ let private continueAfterParams (request : AuthenticationRequest) (paramsResult 
 ///   <item>
 ///     <term><c>Ldap config</c></term>
 ///     <description>
-///       TCP to <c>connectHost</c> port 389 (<c>LdapPlain</c>) or 636 (<c>LdapTls</c>; TLS not fully
-///       implemented beyond port selection). SASL bind with mechanism <c>GSS-SPNEGO</c>
-///       (Kerberos single-shot or NTLM two-leg). Returns <c>AuthLdap</c> with stream, NextMessageId,
-///       optional BoundAs. No Search/Modify — caller owns further LDAP ops.
+///       TCP to <c>connectHost</c> port 389 (<c>LdapPlain</c>) or 636 (<c>LdapTls</c>; implicit TLS
+///       via <c>SslStream</c>, server certificate always accepted). SASL bind with mechanism
+///       <c>GSS-SPNEGO</c> (Kerberos single-shot or NTLM two-leg), carried over the transport
+///       stream. Returns <c>AuthLdap</c> with stream, NextMessageId, optional BoundAs.
+///       No Search/Modify — caller owns further LDAP ops.
 ///     </description>
 ///   </item>
 ///   <item>

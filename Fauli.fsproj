@@ -12,7 +12,7 @@
 
     <!-- Packaging metadata for NuGet (local or published) -->
     <PackageId>Fauli</PackageId>
-    <Version>2026.8.15</Version>
+    <Version>2026.8.16</Version>
     <Authors>jmhickman</Authors>
     <Description>Authentication solver for Active Directory environments. Given credentials, a target host, and a protocol (SMB, LDAP, etc.), Fauli selects the best authentication method (Kerberos, NetNTLMv2, certificate, etc.) and produces an authenticated connection handle.</Description>
     <PackageTags>kerberos;ntlm;smb;ldap;authentication;active-directory</PackageTags>
