@@ -524,7 +524,7 @@ let private sendInitialRequest (state : AsExchange) : Result<AsExchange, AuthErr
     let response = sendKdcRequest state.kdcHost 88 initialReq
     let preAuthNow =
         match extractStimeFromKrbError response with
-        | Some st -> st.AddSeconds(1.0)
+        | Some st -> st.AddSeconds 1.0 
         | None -> DateTime.UtcNow
     match checkInitialAsRep response with
     | Error e -> e |> Error
