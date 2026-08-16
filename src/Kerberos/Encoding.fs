@@ -1,16 +1,20 @@
+///
 /// Hand-rolled BER/DER encoder for Kerberos wire format (RFC 4120 / RFC 4506).
 /// Kerberos uses BER encoding over UDP/TCP to port 88.
 ///
 /// KEY RULE: All explicit context tags in Kerberos ASN.1 are CONSTRUCTED — they wrap inner tags.
+/// 
 module internal Fauli.Kerberos.Encoding
 
+
 open System
+
+
 open System.Text
+
+
 open Fauli.Constants
 
-// ---------------------------------------------------------------------------
-// BER tag classes
-// ---------------------------------------------------------------------------
 
 type TagClass =
     | Universal = 0b00
@@ -18,19 +22,18 @@ type TagClass =
     | Context = 0b10
     | Private = 0b11
 
+
 type TagConstruction =
     | Primitive = 0uy
     | Constructed = 0x20uy  // bit 5 = 0x20 (32)
 
-// ---------------------------------------------------------------------------
-// Byte array helpers
-// ---------------------------------------------------------------------------
 
 let private concat2 (a : byte array) (b : byte array) : byte array =
     let result = Array.zeroCreate<byte> (a.Length + b.Length)
     Array.Copy(a, 0, result, 0, a.Length)
     Array.Copy(b, 0, result, a.Length, b.Length)
     result
+
 
 let private concatMany (arrays : byte array array) : byte array =
     let result = Array.zeroCreate<byte> (arrays |> Array.sumBy Array.length)
@@ -43,9 +46,6 @@ let private concatMany (arrays : byte array array) : byte array =
     copyLoop 0 0
     result
 
-// ---------------------------------------------------------------------------
-// Low-level BER encoding primitives
-// ---------------------------------------------------------------------------
 
 let private encodeTag (tagClass : TagClass) (construction : TagConstruction) (tagNumber : int) : byte array =
     match tagNumber < 31 with
@@ -56,9 +56,9 @@ let private encodeTag (tagClass : TagClass) (construction : TagConstruction) (ta
             if idx < arr.Length - 1 && arr.[idx] = 0uy then findStart arr (idx + 1)
             else idx
         let startIdx = findStart tagBytes 0
-        // Actual bytes
         Array.sub tagBytes startIdx (tagBytes.Length - startIdx)
         |> concat2 [| byte (int tagClass <<< 6) ||| byte construction ||| 0x1Fuy |]
+
 
 let private encodeLength (len : int) : byte array =
     match len < 128 with
@@ -71,13 +71,11 @@ let private encodeLength (len : int) : byte array =
         let actualBytes = Array.sub lenBytes (findStart lenBytes 0) (lenBytes.Length - findStart lenBytes 0)
         concat2 [| byte (0x80 ||| actualBytes.Length) |] actualBytes
 
+
 let encodeTlv (tagBytes : byte array) (value : byte array) : byte array =
     let lenBytes = encodeLength value.Length
     concatMany [| tagBytes; lenBytes; value |]
 
-// ---------------------------------------------------------------------------
-// BER type encoders
-// ---------------------------------------------------------------------------
 
 let encodeInteger (value : int) : byte array =
     let raw = BitConverter.GetBytes(value) |> Array.rev
@@ -89,14 +87,17 @@ let encodeInteger (value : int) : byte array =
     let tag = encodeTag TagClass.Universal TagConstruction.Primitive 2
     encodeTlv tag (Array.sub raw (stripLeading raw 0) (raw.Length - stripLeading raw 0))
 
+
 let encodeGeneralString (value : string) : byte array =
     let bytes = Encoding.ASCII.GetBytes value
     let tag = encodeTag TagClass.Universal TagConstruction.Primitive 27
     encodeTlv tag bytes
 
+
 let encodeOctetString (value : byte array) : byte array =
     let tag = encodeTag TagClass.Universal TagConstruction.Primitive 4
     encodeTlv tag value
+
 
 let encodeBoolean (value : bool) : byte array =
     let bytes =
@@ -106,19 +107,23 @@ let encodeBoolean (value : bool) : byte array =
     let tag = encodeTag TagClass.Universal TagConstruction.Primitive 1
     encodeTlv tag bytes
 
+
 let encodeSequence (children : byte array array) : byte array =
     let content = concatMany children
     let tag = encodeTag TagClass.Universal TagConstruction.Constructed 16
     encodeTlv tag content
 
+
 let encodeSequenceOf (childEncoder : 'a -> byte array) (items : 'a array) : byte array =
     encodeSequence (Array.map childEncoder items)
 
+
+///
 /// Encode a BIT STRING with the given flag positions set.
 /// BER convention: bit 0 is the MSB of the first octet.
 /// Kerberos requires at least 32 bits (RFC 4120 §5.2.8).
+/// 
 let encodeBitString (flagPositions : int list) : byte array =
-    // KerberosFlags ::= BIT STRING (SIZE (32..MAX))
     let byteCount =
         match flagPositions with
         | [] -> 4
@@ -130,42 +135,43 @@ let encodeBitString (flagPositions : int list) : byte array =
     let tag = encodeTag TagClass.Universal TagConstruction.Primitive 3
     encodeTlv tag content
 
+
 let encodeGeneralizedTime (dt : DateTime) : byte array =
     let tag = encodeTag TagClass.Universal TagConstruction.Primitive 24
     let s = dt.ToUniversalTime().ToString("yyyyMMddHHmmssZ", System.Globalization.CultureInfo.InvariantCulture)
     encodeTlv tag (Encoding.ASCII.GetBytes s)
 
+
 let encodeContextPrimitive (n : int) (value : byte array) : byte array =
     let tag = encodeTag TagClass.Context TagConstruction.Primitive n
     encodeTlv tag value
+
 
 let encodeContextConstructed (n : int) (value : byte array) : byte array =
     let tag = encodeTag TagClass.Context TagConstruction.Constructed n
     encodeTlv tag value
 
+
 let encodeApplicationConstructed (n : int) (content : byte array) : byte array =
     let tag = encodeTag TagClass.Application TagConstruction.Constructed n
     encodeTlv tag content
+
 
 let encodeOptional (encoder : 'a -> byte array) (option : 'a option) : byte array =
     match option with
     | Some v -> encoder v
     | None -> [||]
 
-// ---------------------------------------------------------------------------
-// Kerberos-specific composite encoders
-//
-// All explicit context tags in Kerberos ASN.1 are CONSTRUCTED.
-// They wrap inner tags (e.g., [0] INTEGER → 80 LL 02 LL value).
-// ---------------------------------------------------------------------------
 
 let encodePrincipalName (nameType : int) (nameString : string array) : byte array =
     encodeSequence
         [| encodeContextConstructed 0 (encodeInteger nameType)
            encodeContextConstructed 1 (encodeSequenceOf encodeGeneralString nameString) |]
 
+
 let encodeRealm (realm : string) : byte array =
     encodeGeneralString realm
+
 
 let encodeEncryptedData (etype : int) (kvno : int option) (cipher : byte array) : byte array =
     encodeSequence
@@ -173,39 +179,50 @@ let encodeEncryptedData (etype : int) (kvno : int option) (cipher : byte array) 
            encodeOptional (fun v -> encodeContextConstructed 1 (encodeInteger v)) kvno
            encodeContextConstructed 2 (encodeOctetString cipher) |]
 
+
 let encodeEncryptionKey (keyType : int) (keyValue : byte array) : byte array =
     encodeSequence
         [| encodeContextConstructed 0 (encodeInteger keyType)
            encodeContextConstructed 1 (encodeOctetString keyValue) |]
 
+
+///
 /// Checksum ::= SEQUENCE { cksumtype [0] Int32, checksum [1] OCTET STRING }
 let encodeChecksum (cksumtype : int) (checksum : byte array) : byte array =
     encodeSequence
         [| encodeContextConstructed 0 (encodeInteger cksumtype)
            encodeContextConstructed 1 (encodeOctetString checksum) |]
 
+
+///
 /// RFC 4121 §4.1.1 GSS-API checksum body used inside Authenticator.cksum
 /// (cksumtype 0x8003). Layout is little-endian:
 ///   Lgth (uint32=16) || Bnd (16 octets) || Flags (uint32)
+/// 
 let encodeGssApiChecksumBody (flags : uint32) : byte array =
     let lgth = BitConverter.GetBytes 16u
     let bnd = Array.zeroCreate<byte> 16
     let flagsBytes = BitConverter.GetBytes flags
     concatMany [| lgth; bnd; flagsBytes |]
 
+
 let encodePaEncTsEnc (timestamp : DateTime) (usec : int option) : byte array =
     encodeSequence
         [| encodeContextConstructed 0 (encodeGeneralizedTime timestamp)
            encodeOptional (fun v -> encodeContextConstructed 1 (encodeInteger v)) usec |]
 
+
 let encodePaPacRequest (includePac : bool) : byte array =
     encodeSequence [| encodeContextConstructed 0 (encodeBoolean includePac) |]
+
 
 let encodePaData (padataType : int) (padataValue : byte array) : byte array =
     encodeSequence
         [| encodeContextConstructed 1 (encodeInteger padataType)
            encodeContextConstructed 2 (encodeOctetString padataValue) |]
 
+
+///
 /// KDC options: map option names to bit positions
 let private kdcOptionMap =
     Map [ "forwardable", 1
@@ -225,10 +242,12 @@ let private kdcOptionMap =
           "renew", 30
           "validate", 31 ]
 
+
 let encodeKdcOptions (options : string list) : byte array =
     options
     |> List.choose (fun opt -> Map.tryFind opt kdcOptionMap)
     |> encodeBitString
+
 
 let encodeApOptions (options : string list) : byte array =
     options
@@ -239,11 +258,14 @@ let encodeApOptions (options : string list) : byte array =
         | _ -> None)
     |> encodeBitString
 
+
+///
 /// Encode KDC-REQ-BODY per RFC 4120:
 /// [0] kdc-options, [1] cname (opt), [2] realm, [3] sname (opt),
 /// [4] from (opt), [5] till (opt), [6] rtime (opt), [7] nonce,
 /// [8] etype, [9] addresses (opt), [10] enc-authorization-data (opt),
 /// [11] additional-tickets (opt)
+/// 
 let encodeKdcReqBody
     kdcOptions cname realm sname till rtime nonce etype additionalTickets : byte array =
     encodeSequence
@@ -258,8 +280,11 @@ let encodeKdcReqBody
            Option.defaultValue [||] (Option.map (fun ticks ->
                encodeContextConstructed 11 (encodeSequence ticks)) additionalTickets) |]
 
+
+///
 /// Encode KDC-REQ (base for AS-REQ and TGS-REQ)
 /// All EXPLICIT tags in Kerberos are constructed (wrap inner tag).
+/// 
 let encodeKdcReq (msgType : int) (padata : byte array array option) (reqBody : byte array) : byte array =
     encodeSequence
         [| encodeContextConstructed 1 (encodeInteger 5)
@@ -268,12 +293,16 @@ let encodeKdcReq (msgType : int) (padata : byte array array option) (reqBody : b
                encodeContextConstructed 3 (encodeSequence pa)) padata)
            encodeContextConstructed 4 reqBody |]
 
+
 let encodeAsReq (kdcReq : byte array) : byte array =
     encodeApplicationConstructed 10 kdcReq
+
 
 let encodeTgsReq (kdcReq : byte array) : byte array =
     encodeApplicationConstructed 12 kdcReq
 
+
+///
 /// Encode Ticket: [APPLICATION 1]
 let encodeTicket tktVno realm sname encPart : byte array =
     let content =
@@ -284,6 +313,8 @@ let encodeTicket tktVno realm sname encPart : byte array =
                encodeContextConstructed 3 encPart |]
     encodeApplicationConstructed 1 content
 
+
+///
 /// Encode AP-REQ: [APPLICATION 14]
 let encodeApReq apOptions ticket authenticator : byte array =
     let content =
@@ -295,6 +326,8 @@ let encodeApReq apOptions ticket authenticator : byte array =
                encodeContextConstructed 4 authenticator |]
     encodeApplicationConstructed 14 content
 
+
+///
 /// Encode Authenticator: [APPLICATION 2]
 let encodeAuthenticator crealm cname cusec ctime cksum seqNumber : byte array =
     encodeApplicationConstructed 2

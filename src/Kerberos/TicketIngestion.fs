@@ -1,15 +1,13 @@
 module internal Fauli.Kerberos.TicketIngestion
 
 open System
+
+
 open Fauli.Domain
 open Fauli.Kerberos.Parsing
 open Fauli.Kerberos.Auth
 open Fauli.Kerberos.Encryption
 
-
-// ---------------------------------------------------------------------------
-// Parsing errors
-// ---------------------------------------------------------------------------
 
 type TicketParseError =
     | InvalidKirbiFormat
@@ -19,10 +17,8 @@ type TicketParseError =
     | TgtExpired of DateTime
     | ParseError of string
 
-// ---------------------------------------------------------------------------
-// Shared BER helpers for principal / key extraction
-// ---------------------------------------------------------------------------
 
+///
 /// Kerberos string component from a BER name-string element.
 let private kerberosStringFromBer (str : BerValue) : string option =
     match str with
@@ -31,6 +27,7 @@ let private kerberosStringFromBer (str : BerValue) : string option =
     | _ -> None
 
 
+///
 /// SEQUENCE body under a context tag, when present.
 let private sequenceAt (items : BerValue list) (tag : int) : BerValue list option =
     match contextAt items tag with
@@ -38,6 +35,7 @@ let private sequenceAt (items : BerValue list) (tag : int) : BerValue list optio
     | _ -> None
 
 
+///
 /// GeneralString under a context tag, when present.
 let private generalStringAt (items : BerValue list) (tag : int) : string option =
     match contextAt items tag with
@@ -45,6 +43,7 @@ let private generalStringAt (items : BerValue list) (tag : int) : string option 
     | _ -> None
 
 
+///
 /// Integer under a context tag, or a default when missing.
 let private integerAtOr (items : BerValue list) (tag : int) (defaultValue : int) : int =
     match contextAt items tag with
@@ -52,6 +51,7 @@ let private integerAtOr (items : BerValue list) (tag : int) (defaultValue : int)
     | None -> defaultValue
 
 
+///
 /// OCTET STRING under a context tag, or empty when missing.
 let private octetStringAtOrEmpty (items : BerValue list) (tag : int) : byte array =
     match contextAt items tag with
@@ -59,14 +59,17 @@ let private octetStringAtOrEmpty (items : BerValue list) (tag : int) : byte arra
     | None -> [||]
 
 
+///
 /// Parse a PrincipalName from BER (RFC 4120 §7.5.1).
 /// [0] name-type (Int32), [1] name-string (SEQUENCE OF KerberosString)
+/// 
 let private parsePrincipalName (items : BerValue list) : string list =
     match sequenceAt items 1 with
     | None -> []
     | Some ss -> ss |> List.choose kerberosStringFromBer
 
 
+///
 /// True when the server principal names a TGT (krbtgt/...).
 let private isTgtServerName (serverName : string list) : bool =
     match serverName with
@@ -74,8 +77,10 @@ let private isTgtServerName (serverName : string list) : bool =
     | head :: _ -> head = "krbtgt"
 
 
+///
 /// Parse an EncryptionKey from BER (RFC 4120 §7.5.1).
 /// [0] keytype (Int32), [1] keyvalue (OCTET STRING)
+/// 
 let private parseEncryptionKey (v : BerValue) : Key option =
     match v with
     | BerSequence kf ->
@@ -90,21 +95,19 @@ let private parseEncryptionKey (v : BerValue) : Key option =
     | _ -> None
 
 
+///
 /// Encryption key under context tag 0 of KrbCredInfo (sequence or bare).
 let private sessionKeyFromCredInfo (items : BerValue list) : Key =
     let fallback =
         { enctype = EncryptionType.AES256_CTS_HMAC_SHA1_96
           contents = [||] }
-
     match contextAt items 0 with
     | Some (BerSequence kf) -> defaultArg (parseEncryptionKey (BerSequence kf)) fallback
     | Some v -> defaultArg (parseEncryptionKey v) fallback
     | None -> fallback
 
-// ---------------------------------------------------------------------------
-// .kirbi (KRB-CRED) parser — RFC 4120 §5.5
-// ---------------------------------------------------------------------------
 
+///
 /// Parsed credential info from one KrbCredInfo entry in a .kirbi file.
 type KirbiCredInfo =
     { sessionKey : Key
@@ -116,32 +119,32 @@ type KirbiCredInfo =
       ticketBytes : byte array }
 
 
+///
 /// Find the TGT credential among parsed KrbCredInfo entries.
 let private findTgtInKirbi (creds : KirbiCredInfo list) : Result<KirbiCredInfo, TicketParseError> =
     let isKirbiTgt (c : KirbiCredInfo) = isTgtServerName c.serverName
     match creds |> List.tryFind isKirbiTgt with
-    | Some cred -> Ok cred
-    | None -> Error NoTgtFound
+    | Some cred -> cred |> Ok
+    | None -> NoTgtFound |> Error
 
 
+///
 /// Parse one KrbCredInfo from BER (RFC 4120 §5.5).
 /// Ticket bytes are paired later from the KRB-CRED tickets field.
+/// 
 let private parseKrbCredInfo (items : BerValue list) : KirbiCredInfo option =
     let clientName =
         match sequenceAt items 2 with
         | None -> []
         | Some sn -> parsePrincipalName sn
-
     let serverName =
         match sequenceAt items 9 with
         | None -> []
         | Some sn -> parsePrincipalName sn
-
     let endtime =
         match contextAt items 6 with
         | Some v -> Some (asGeneralizedTime v)
         | None -> None
-
     Some
         { sessionKey = sessionKeyFromCredInfo items
           clientName = clientName
@@ -152,6 +155,7 @@ let private parseKrbCredInfo (items : BerValue list) : KirbiCredInfo option =
           ticketBytes = [||] }
 
 
+///
 /// Attach raw ticket TLV bytes by index to each credential info.
 let private pairCredWithTicket (rawTickets : byte array list) (index : int) (cred : KirbiCredInfo) : KirbiCredInfo =
     let ticketBytes =
@@ -161,6 +165,7 @@ let private pairCredWithTicket (rawTickets : byte array list) (index : int) (cre
     { cred with ticketBytes = ticketBytes }
 
 
+///
 /// Parse SEQUENCE OF KrbCredInfo into domain records.
 let private parseKrbCredInfoList (ticketInfos : BerValue list) : KirbiCredInfo list =
     let fromInfo info =
@@ -170,23 +175,21 @@ let private parseKrbCredInfoList (ticketInfos : BerValue list) : KirbiCredInfo l
     ticketInfos |> List.choose fromInfo
 
 
-// ---------------------------------------------------------------------------
-// Raw ticket TLV walk (byte-level, no re-encode)
-// ---------------------------------------------------------------------------
-
+///
 /// Advance past a high-tag-number tag encoding.
 let private skipHighTagNumber (data : byte array) (pos : int) : int =
     let rec loop p =
-        match (data.[p] &&& 0x80uy) <> 0uy with
+        match data.[p] &&& 0x80uy <> 0uy with
         | true -> loop (p + 1)
         | false -> p + 1
     loop pos
 
 
+///
 /// Decode definite BER length at lenBytePos → (contentStart, contentEnd).
 let private decodeDefiniteLength (data : byte array) (lenBytePos : int) : int * int =
     let lenByte = data.[lenBytePos]
-    match (lenByte &&& 0x80uy) = 0uy with
+    match lenByte &&& 0x80uy = 0uy with
     | true ->
         let contentStart = lenBytePos + 1
         contentStart, contentStart + int lenByte
@@ -195,11 +198,12 @@ let private decodeDefiniteLength (data : byte array) (lenBytePos : int) : int * 
         let rec foldLen i p acc =
             match i >= numLenBytes with
             | true -> acc, p
-            | false -> foldLen (i + 1) (p + 1) ((acc <<< 8) ||| int data.[p])
+            | false -> foldLen (i + 1) (p + 1) (acc <<< 8 ||| int data.[p])
         let length, contentStart = foldLen 0 (lenBytePos + 1) 0
         contentStart, contentStart + length
 
 
+///
 /// Returns (contentStart, contentEnd) for the TLV at pos.
 let private parseTlvBytes (data : byte array) (pos : int) : int * int =
     let tagByte = data.[pos]
@@ -212,6 +216,7 @@ let private parseTlvBytes (data : byte array) (pos : int) : int * int =
     decodeDefiniteLength data lenBytePos
 
 
+///
 /// List of (tlvStart, nextPos) for each item in a BER sequence span.
 let private parseSequenceItems (data : byte array) (start : int) (end_ : int) : (int * int) list =
     let rec loop pos acc =
@@ -223,6 +228,7 @@ let private parseSequenceItems (data : byte array) (start : int) (end_ : int) : 
     loop start []
 
 
+///
 /// Locate context [2] (tickets) inside a KRB-CRED SEQUENCE item list.
 let private findTicketsContextOffset (rawData : byte array) (seqItems : (int * int) list) : int option =
     let isTicketsContext (tlvStart, _) =
@@ -232,9 +238,9 @@ let private findTicketsContextOffset (rawData : byte array) (seqItems : (int * i
     seqItems |> List.tryPick isTicketsContext
 
 
+///
 /// Extract full Ticket TLVs from the original KRB-CRED bytes.
 let private extractRawTickets (rawData : byte array) : byte array list =
-    // Walk: APPLICATION 22 -> SEQUENCE -> context [2] -> SEQUENCE OF Ticket
     let appCs, _ = parseTlvBytes rawData 0
     let seqCs, seqCe = parseTlvBytes rawData appCs
     let seqItems = parseSequenceItems rawData seqCs seqCe
@@ -247,6 +253,7 @@ let private extractRawTickets (rawData : byte array) : byte array list =
         |> List.map (fun (tlvStart, nextPos) -> Array.sub rawData tlvStart (nextPos - tlvStart))
 
 
+///
 /// EncryptedData fields: etype + cipher octets from enc-part [3].
 let private encryptedDataParts (encPartVal : BerValue) : int * byte array =
     match encPartVal with
@@ -254,11 +261,13 @@ let private encryptedDataParts (encPartVal : BerValue) : int * byte array =
     | _ -> 0, [||]
 
 
+///
 /// Ticket-info SEQUENCE OF KrbCredInfo under EncKrbCredPart [0].
 let private ticketInfoSequence (encFields : BerValue list) : BerValue list =
     defaultArg (sequenceAt encFields 0) []
 
 
+///
 /// Build credential list with paired ticket TLVs from a parsed EncKrbCredPart.
 let private credentialsFromEncKrbCredPart (rawData : byte array) (encFields : BerValue list) : Result<KirbiCredInfo, TicketParseError> =
     let credInfos = parseKrbCredInfoList (ticketInfoSequence encFields)
@@ -268,35 +277,34 @@ let private credentialsFromEncKrbCredPart (rawData : byte array) (encFields : Be
     |> findTgtInKirbi
 
 
+///
 /// Continue kirbi parse after outer KRB-CRED SEQUENCE is obtained.
 let private parseKirbiFromCredSequence (rawData : byte array) (fields : BerValue list) : Result<KirbiCredInfo, TicketParseError> =
     let encPartVal = defaultArg (contextAt fields 3) (BerSequence [])
     let _, cipherBytes = encryptedDataParts encPartVal
     match cipherBytes.Length = 0 with
-    | true -> Error InvalidKirbiFormat
+    | true -> InvalidKirbiFormat |> Error
     | false ->
-        // etype=0 means plaintext — cipher contains EncKrbCredPart directly
         match parseBer cipherBytes with
         | BerSequence encFields -> credentialsFromEncKrbCredPart rawData encFields
-        | _ -> Error InvalidKirbiFormat
+        | _ -> InvalidKirbiFormat |> Error
 
 
+///
 /// Parse a .kirbi file (KRB-CRED, APPLICATION 22) and extract the TGT credential.
 let parseKirbi (rawData : byte array) : Result<KirbiCredInfo, TicketParseError> =
     try
         match rawData.Length < 4 with
-        | true -> Error InvalidKirbiFormat
+        | true -> InvalidKirbiFormat |> Error
         | false ->
             match parseBer rawData with
             | BerSequence fields -> parseKirbiFromCredSequence rawData fields
-            | _ -> Error InvalidKirbiFormat
+            | _ -> InvalidKirbiFormat |> Error
     with ex ->
-        Error (ParseError ex.Message)
+        ParseError ex.Message |> Error
 
-// ---------------------------------------------------------------------------
-// .ccache (MIT credential cache) parser — version 4
-// ---------------------------------------------------------------------------
 
+///
 /// Binary reader state for .ccache parsing.
 type CcacheReader =
     { data : byte array
@@ -320,12 +328,14 @@ let private ccacheReadByte (r : CcacheReader) : byte * CcacheReader =
     r.data.[r.pos], { r with pos = r.pos + 1 }
 
 
+///
 /// Read a big-endian uint16 (network byte order).
 let private ccacheReadUint16 (r : CcacheReader) : uint16 * CcacheReader =
     let bytes, r' = ccacheReadBytes r 2
     uint16 (int bytes.[0] <<< 8 ||| int bytes.[1]), r'
 
 
+///
 /// Read a big-endian uint32 (network byte order).
 let private ccacheReadUint32 (r : CcacheReader) : uint32 * CcacheReader =
     let b0, r1 = ccacheReadByte r
@@ -335,18 +345,21 @@ let private ccacheReadUint32 (r : CcacheReader) : uint32 * CcacheReader =
     (uint32 b0 <<< 24) ||| (uint32 b1 <<< 16) ||| (uint32 b2 <<< 8) ||| uint32 b3, r4
 
 
+///
 /// Read a CountedOctetString: uint32 length + that many bytes.
 let private ccacheReadCountedOctetString (r : CcacheReader) : byte array * CcacheReader =
     let len, r' = ccacheReadUint32 r
     ccacheReadBytes r' (int len)
 
 
+///
 /// Read a CountedOctetString as ASCII string.
 let private ccacheReadString (r : CcacheReader) : string * CcacheReader =
     let bytes, r' = ccacheReadCountedOctetString r
     System.Text.Encoding.ASCII.GetString bytes, r'
 
 
+///
 /// Parse a ccache Principal (version 4).
 let private ccacheReadPrincipal (r : CcacheReader) : (int * string list * string) * CcacheReader =
     let nameType, r1 = ccacheReadUint32 r
@@ -362,6 +375,7 @@ let private ccacheReadPrincipal (r : CcacheReader) : (int * string list * string
     (int nameType, components, realm), rFinal
 
 
+///
 /// Parse a KeyBlockV4.
 let private ccacheReadKeyBlockV4 (r : CcacheReader) : Key * CcacheReader =
     let keyType, r1 = ccacheReadUint16 r
@@ -372,6 +386,7 @@ let private ccacheReadKeyBlockV4 (r : CcacheReader) : Key * CcacheReader =
       contents = keyValue }, r4
 
 
+///
 /// Parse an Address: addrtype (uint16), addrdata (CountedOctetString).
 let private ccacheReadAddress (r : CcacheReader) : CcacheReader =
     let _, r1 = ccacheReadUint16 r
@@ -379,6 +394,7 @@ let private ccacheReadAddress (r : CcacheReader) : CcacheReader =
     r2
 
 
+///
 /// Parse an AuthData: authtype (uint16), authdata (CountedOctetString).
 let private ccacheReadAuthData (r : CcacheReader) : CcacheReader =
     let _, r1 = ccacheReadUint16 r
@@ -386,6 +402,7 @@ let private ccacheReadAuthData (r : CcacheReader) : CcacheReader =
     r2
 
 
+///
 /// Skip N address records.
 let private ccacheSkipAddresses (count : int) (r : CcacheReader) : CcacheReader =
     let rec loop i reader =
@@ -395,6 +412,7 @@ let private ccacheSkipAddresses (count : int) (r : CcacheReader) : CcacheReader 
     loop 0 r
 
 
+///
 /// Skip N authdata records.
 let private ccacheSkipAuthData (count : int) (r : CcacheReader) : CcacheReader =
     let rec loop i reader =
@@ -404,6 +422,7 @@ let private ccacheSkipAuthData (count : int) (r : CcacheReader) : CcacheReader =
     loop 0 r
 
 
+///
 /// After keyblock: skip timestamps, flags, addresses, authdata; return endtime + ticket + next reader.
 let private ccacheReadCredentialTail (r : CcacheReader) : uint32 * byte array * CcacheReader =
     let _, r4 = ccacheReadUint32 r       // authtime
@@ -421,6 +440,7 @@ let private ccacheReadCredentialTail (r : CcacheReader) : uint32 * byte array * 
     endTimeTs, ticketBytes, r15
 
 
+///
 /// Skip an entire config credential (X-CACHECONF) without materializing it.
 let private ccacheSkipConfigCredential (r : CcacheReader) : CcacheReader =
     let _, r3 = ccacheReadKeyBlockV4 r
@@ -428,6 +448,7 @@ let private ccacheSkipConfigCredential (r : CcacheReader) : CcacheReader =
     r15
 
 
+///
 /// Parsed credential from a .ccache file.
 type CcacheCredential =
     { clientName : string list
@@ -439,14 +460,16 @@ type CcacheCredential =
       ticketBytes : byte array }
 
 
+///
 /// Find the TGT credential among parsed ccache credentials.
 let private findTgtInCcache (creds : CcacheCredential list) : Result<CcacheCredential, TicketParseError> =
     let isCcacheTgt (c : CcacheCredential) = isTgtServerName c.serverName
     match creds |> List.tryFind isCcacheTgt with
-    | Some cred -> Ok cred
-    | None -> Error NoTgtFound
+    | Some cred -> cred |> Ok
+    | None -> NoTgtFound |> Error
 
 
+///
 /// Convert a Unix timestamp (seconds since epoch) to DateTime UTC.
 let private unixTimestampToDateTime (ts : uint32) : DateTime option =
     match ts with
@@ -454,6 +477,7 @@ let private unixTimestampToDateTime (ts : uint32) : DateTime option =
     | _ -> Some (DateTimeOffset.FromUnixTimeSeconds(int64 ts).UtcDateTime)
 
 
+///
 /// Materialize one non-config credential from principals + remaining body.
 let private ccacheBuildCredential (clientName : string list) (clientRealm : string) (serverName : string list) (serverRealm : string) (r : CcacheReader) : CcacheCredential * CcacheReader =
     let sessionKey, r3 = ccacheReadKeyBlockV4 r
@@ -469,6 +493,7 @@ let private ccacheBuildCredential (clientName : string list) (clientRealm : stri
     cred, r15
 
 
+///
 /// Read one credential entry; None means stop (EOF / parse failure).
 let private ccacheTryReadOneCredential (r : CcacheReader) : (CcacheCredential option * CcacheReader) option =
     match r.pos >= r.data.Length with
@@ -487,6 +512,7 @@ let private ccacheTryReadOneCredential (r : CcacheReader) : (CcacheCredential op
             None
 
 
+///
 /// Parse all credential entries until EOF or a hard parse failure.
 let private ccacheReadAllCredentials (r : CcacheReader) : CcacheCredential list =
     let rec loop acc reader =
@@ -497,6 +523,7 @@ let private ccacheReadAllCredentials (r : CcacheReader) : CcacheCredential list 
     loop [] r
 
 
+///
 /// Skip header tag entries after the mini-header.
 let private ccacheSkipHeaders (remaining : int) (r : CcacheReader) : CcacheReader =
     let rec loop left reader =
@@ -510,39 +537,39 @@ let private ccacheSkipHeaders (remaining : int) (r : CcacheReader) : CcacheReade
     loop remaining r
 
 
+///
 /// Parse ccache v4 body after version bytes have been validated.
 let private parseCcacheV4Body (rawData : byte array) : Result<CcacheCredential, TicketParseError> =
     let headerLen, _ = ccacheReadUint16 { data = rawData; pos = 2 }
     let afterHeaders = ccacheSkipHeaders (int headerLen) { data = rawData; pos = 4 }
     let _, afterPrincipal = ccacheReadPrincipal afterHeaders
     match ccacheReadAllCredentials afterPrincipal with
-    | [] -> Error InvalidCcacheFormat
+    | [] -> InvalidCcacheFormat |> Error
     | credentials -> findTgtInCcache credentials
 
 
+///
 /// Parse a .ccache file (MIT credential cache, version 4) and extract the TGT credential.
 let parseCcache (rawData : byte array) : Result<CcacheCredential, TicketParseError> =
     try
         match rawData.Length < 6 with
-        | true -> Error InvalidCcacheFormat
+        | true -> InvalidCcacheFormat |> Error
         | false ->
             match rawData.[0], rawData.[1] with
             | 0x05uy, 0x04uy -> parseCcacheV4Body rawData
-            | _ -> Error InvalidCcacheFormat
+            | _ -> InvalidCcacheFormat |> Error
     with ex ->
-        Error (ParseError ex.Message)
+        ParseError ex.Message |> Error
 
-// ---------------------------------------------------------------------------
-// .ccache (MIT credential cache) writer — version 4
-// ---------------------------------------------------------------------------
 
+///
 /// Mutable byte buffer used only at the serialization edge.
 type private CcacheWriter =
-    { buffer : System.Collections.Generic.List<byte> }
+    { buffer : ResizeArray<byte> }
 
 
 let private createCcacheWriter () : CcacheWriter =
-    { buffer = System.Collections.Generic.List<byte>() }
+    { buffer = ResizeArray<byte>() }
 
 
 let private writeByte (w : CcacheWriter) (b : byte) : unit =
@@ -576,6 +603,7 @@ let private writeCountedBytes (w : CcacheWriter) (b : byte array) : unit =
     writeBytes w b
 
 
+///
 /// Client principal name components from an optional cname BER value.
 let private cnameComponentsFromTgt (tgt : TgtResult) : string list =
     match tgt.cname with
@@ -591,6 +619,7 @@ let private toUnixTimestamp (dt : DateTime) : uint32 =
     uint32 (int64 (dt - epoch).TotalSeconds)
 
 
+///
 /// Write mini-header + default header entry for ccache v4.
 let private writeCcacheHeader (w : CcacheWriter) : unit =
     writeUint16BE w 0x0504us
@@ -600,6 +629,7 @@ let private writeCcacheHeader (w : CcacheWriter) : unit =
     writeBytes w [| 0xFFuy; 0xFFuy; 0xFFuy; 0xFFuy; 0x00uy; 0x00uy; 0x00uy; 0x00uy |]
 
 
+///
 /// Write a simple one-component principal (name_type=1).
 let private writeSimplePrincipal (w : CcacheWriter) (realm : string) (name : string) : unit =
     writeUint32BE w 1u
@@ -608,6 +638,7 @@ let private writeSimplePrincipal (w : CcacheWriter) (realm : string) (name : str
     writeCountedString w name
 
 
+///
 /// Write krbtgt/REALM server principal (NT-SRV-INST).
 let private writeKrbtgtPrincipal (w : CcacheWriter) (realm : string) : unit =
     writeUint32BE w 2u
@@ -617,6 +648,7 @@ let private writeKrbtgtPrincipal (w : CcacheWriter) (realm : string) : unit =
     writeCountedString w realm
 
 
+///
 /// Write KeyBlockV4 for the TGT session key.
 let private writeSessionKeyBlock (w : CcacheWriter) (tgt : TgtResult) : unit =
     let keyBytes = tgt.sessionKey.contents
@@ -626,6 +658,7 @@ let private writeSessionKeyBlock (w : CcacheWriter) (tgt : TgtResult) : unit =
     writeBytes w keyBytes
 
 
+///
 /// Write credential timestamps derived from TGT server time.
 let private writeCredentialTimestamps (w : CcacheWriter) (tgt : TgtResult) : unit =
     let now = DateTime.UtcNow
@@ -640,12 +673,12 @@ let private writeCredentialTimestamps (w : CcacheWriter) (tgt : TgtResult) : uni
     writeUint32BE w 0u
 
 
+///
 /// Serialize a TgtResult back to a .ccache v4 byte array.
 let internal writeCcache (tgt : TgtResult) : byte array =
     let w = createCcacheWriter ()
     let crealm = defaultArg tgt.crealm "UNKNOWN"
     let principalName = defaultArg (List.tryHead (cnameComponentsFromTgt tgt)) "unknown"
-
     writeCcacheHeader w
     writeSimplePrincipal w crealm principalName
     writeSimplePrincipal w crealm principalName
@@ -660,10 +693,8 @@ let internal writeCcache (tgt : TgtResult) : byte array =
     writeUint32BE w 0u         // second_ticket empty
     w.buffer.ToArray()
 
-// ---------------------------------------------------------------------------
-// Conversion to TgtResult for the solver pipeline
-// ---------------------------------------------------------------------------
 
+///
 /// Convert a parsed KirbiCredInfo to a TgtResult for use with getServiceTicket.
 let private kirbiToTgtResult (cred : KirbiCredInfo) : TgtResult =
     { ticketBytes = cred.ticketBytes
@@ -674,6 +705,7 @@ let private kirbiToTgtResult (cred : KirbiCredInfo) : TgtResult =
       serverTime = None }
 
 
+///
 /// Convert a parsed CcacheCredential to a TgtResult for use with getServiceTicket.
 let private ccacheToTgtResult (cred : CcacheCredential) : TgtResult =
     { ticketBytes = cred.ticketBytes
@@ -684,13 +716,15 @@ let private ccacheToTgtResult (cred : CcacheCredential) : TgtResult =
       serverTime = None }
 
 
+///
 /// Reject expired TGTs; otherwise return the built TgtResult.
 let private tgtResultIfNotExpired (endtime : DateTime option) (tgt : TgtResult) : Result<TgtResult, AuthError> =
     match endtime with
-    | Some dt when dt < DateTime.UtcNow -> Error KerberosTGTExpired
-    | _ -> Ok tgt
+    | Some dt when dt < DateTime.UtcNow -> KerberosTGTExpired |> Error
+    | _ -> tgt |> Ok
 
 
+///
 /// Map TicketParseError to AuthError for the solver boundary.
 let private mapTicketParseError (err : TicketParseError) : AuthError =
     match err with
@@ -702,23 +736,23 @@ let private mapTicketParseError (err : TicketParseError) : AuthError =
     | TgtExpired _ -> KerberosTGTAcquisitionFailed
 
 
+///
 /// Continue after a successful kirbi parse.
 let private continueAfterKirbiParse (parsed : Result<KirbiCredInfo, TicketParseError>) : Result<TgtResult, AuthError> =
     match parsed with
-    | Error e -> Error (mapTicketParseError e)
+    | Error e -> mapTicketParseError e |> Error
     | Ok cred -> tgtResultIfNotExpired cred.endtime (kirbiToTgtResult cred)
 
 
+///
 /// Continue after a successful ccache parse.
 let private continueAfterCcacheParse (parsed : Result<CcacheCredential, TicketParseError>) : Result<TgtResult, AuthError> =
     match parsed with
-    | Error e -> Error (mapTicketParseError e)
+    | Error e -> mapTicketParseError e |> Error
     | Ok cred -> tgtResultIfNotExpired cred.endtime (ccacheToTgtResult cred)
 
-// ---------------------------------------------------------------------------
-// Public API — parse ticket files and produce TgtResult
-// ---------------------------------------------------------------------------
 
+///
 /// Parse a .kirbi file and extract the TGT as a TgtResult.
 let internal extractTgtFromKirbi (rawData : byte array) : Result<TgtResult, AuthError> =
     rawData
@@ -726,6 +760,7 @@ let internal extractTgtFromKirbi (rawData : byte array) : Result<TgtResult, Auth
     |> continueAfterKirbiParse
 
 
+///
 /// Parse a .ccache file and extract the TGT as a TgtResult.
 let internal extractTgtFromCcache (rawData : byte array) : Result<TgtResult, AuthError> =
     rawData

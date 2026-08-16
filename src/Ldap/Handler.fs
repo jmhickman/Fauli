@@ -13,6 +13,7 @@ open Fauli.Ntlm.Crypto
 open Fauli.Ntlm.Encoding
 
 
+///
 /// Result of parsing an LDAP BindResponse. Internal (testable) wire parse product.
 type internal LdapBindResult =
     { resultCode : int
@@ -20,43 +21,39 @@ type internal LdapBindResult =
       diagnosticMessage : string
       serverSaslCreds : byte array option }
 
+
+///
 /// LDAP resultCode values we care about (RFC 4511 §4.1.9).
 let private ldapSuccess = 0
+
+
 let private ldapSaslBindInProgress = 14
 
+
+///
 /// SASL mechanism name for SPNEGO over LDAP (RFC 4178 / MS-ADTS).
 let private saslMechanismGssSpnego = "GSS-SPNEGO"
-
-// ---------------------------------------------------------------------------
-// BER helpers specific to LDAP (RFC 4511 uses OCTET STRING for LDAPString)
-// ---------------------------------------------------------------------------
 
 
 let private encodeLdapString (value : string) : byte array =
     encodeOctetString (Encoding.UTF8.GetBytes value)
 
+
 let internal buildSaslBindRequest (messageId : int) (spnegoToken : byte array) : byte array =
-    // SaslCredentials content under IMPLICIT [3] — no inner SEQUENCE tag.
     let saslContent =
         Array.concat
             [| encodeLdapString saslMechanismGssSpnego
                encodeOctetString spnegoToken |]
-
     let bindRequestBody =
         Array.concat
             [| encodeInteger 3
                encodeLdapString ""
                encodeContextConstructed 3 saslContent |]
-
     let bindRequest = encodeApplicationConstructed 0 bindRequestBody
-
     encodeSequence
         [| encodeInteger messageId
            bindRequest |]
 
-// ---------------------------------------------------------------------------
-// Send / receive a single LDAP BER message over a stream
-// ---------------------------------------------------------------------------
 
 let private mapLdapIoException (action : string) (ex : exn) : AuthError =
     match ex with
@@ -68,11 +65,12 @@ let private sendLdapRequest (stream : NetworkStream) (message : byte array) : Re
     try
         stream.Write(message, 0, message.Length)
         stream.Flush()
-        Ok ()
+        () |> Ok
     with ex ->
-        Error (mapLdapIoException "send" ex)
+        mapLdapIoException "send" ex |> Error
 
 
+///
 /// Read one stream byte as Option (None = EOF).
 let private tryReadByte (stream : NetworkStream) : int option =
     match stream.ReadByte() with
@@ -80,12 +78,14 @@ let private tryReadByte (stream : NetworkStream) : int option =
     | b -> Some b
 
 
+///
 /// Fold big-endian length octets into an integer.
 let private foldBigEndianLength (bytes : byte array) : int =
     bytes
     |> Array.fold (fun acc b -> (acc <<< 8) ||| int b) 0
 
 
+///
 /// Fill a buffer from the stream; false on EOF before complete.
 let private tryFillBuffer (stream : NetworkStream) (buffer : byte array) : bool =
     let rec loop off rem =
@@ -98,10 +98,12 @@ let private tryFillBuffer (stream : NetworkStream) (buffer : byte array) : bool 
     loop 0 buffer.Length
 
 
+///
 /// Decode definite BER length after the first length octet has been read.
 /// Returns (length-prefix-bytes including first octet, content length) or None.
+/// 
 let private decodeBerLengthPrefix (stream : NetworkStream) (lenFirst : int) : (byte array * int) option =
-    match (lenFirst &&& 0x80) = 0 with
+    match lenFirst &&& 0x80 = 0 with
     | true -> Some ([| byte lenFirst |], lenFirst)
     | false ->
         let num = lenFirst &&& 0x7F
@@ -115,41 +117,63 @@ let private decodeBerLengthPrefix (stream : NetworkStream) (lenFirst : int) : (b
                 Some (Array.concat [| [| byte lenFirst |]; lenBytes |], foldBigEndianLength lenBytes)
 
 
+///
 /// Assemble tag + length prefix + content into one BER TLV buffer.
 let private assembleBerMessage (tag : int) (lengthPrefix : byte array) (content : byte array) : byte array =
     Array.concat [| [| byte tag |]; lengthPrefix; content |]
 
 
+///
+/// Read one stream byte as Result (EOF = ProtocolConnectionFailed).
+let private readByteOrFail (stream : NetworkStream) : Result<int, AuthError> =
+    match tryReadByte stream with
+    | None -> ProtocolConnectionFailed |> Error
+    | Some b -> b |> Ok
+
+
+///
+/// Decode a definite BER length prefix from the stream as a Result.
+let private readBerLength (stream : NetworkStream) : Result<byte array * int, AuthError> =
+    match readByteOrFail stream with
+    | Error e -> e |> Error
+    | Ok lenFirst ->
+        match decodeBerLengthPrefix stream lenFirst with
+        | None -> UnexpectedError "LDAP receive: invalid BER length" |> Error
+        | Some (prefix, len) when len < 0 -> UnexpectedError "LDAP receive: invalid BER length" |> Error
+        | Some (prefix, len) -> (prefix, len) |> Ok
+
+
+///
+/// Read exactly len content bytes from the stream as a Result.
+let private readContentOrFail (stream : NetworkStream) (len : int) : Result<byte array, AuthError> =
+    let content = Array.zeroCreate<byte> len
+    match tryFillBuffer stream content with
+    | false -> ProtocolConnectionFailed |> Error
+    | true -> content |> Ok
+
+
+///
 /// Read one complete BER TLV from the stream (tag + length octets + content).
 let private receiveLdapMessage (stream : NetworkStream) : Result<byte array, AuthError> =
     try
-        match tryReadByte stream with
-        | None -> Error ProtocolConnectionFailed
-        | Some tag ->
-            match tryReadByte stream with
-            | None -> Error ProtocolConnectionFailed
-            | Some lenFirst ->
-                match decodeBerLengthPrefix stream lenFirst with
-                | None -> Error (UnexpectedError "LDAP receive: invalid BER length")
-                | Some (lengthPrefix, contentLen) when contentLen < 0 ->
-                    Error (UnexpectedError "LDAP receive: invalid BER length")
-                | Some (lengthPrefix, contentLen) ->
-                    let content = Array.zeroCreate<byte> contentLen
-                    match tryFillBuffer stream content with
-                    | false -> Error ProtocolConnectionFailed
-                    | true -> Ok (assembleBerMessage tag lengthPrefix content)
+        match readByteOrFail stream with
+        | Error e -> e |> Error
+        | Ok tag ->
+            match readBerLength stream with
+            | Error e -> e |> Error
+            | Ok (lengthPrefix, contentLen) ->
+                readContentOrFail stream contentLen
+                |> Result.map (fun content -> assembleBerMessage tag lengthPrefix content)
     with ex ->
-        Error (mapLdapIoException "receive" ex)
+        mapLdapIoException "receive" ex |> Error
 
-// ---------------------------------------------------------------------------
-// BindResponse parsing
-// ---------------------------------------------------------------------------
 
 let private decodeUtf8 (bytes : byte array) : string =
     try Encoding.UTF8.GetString(bytes).Trim('\u0000').Trim()
     with _ -> ""
 
 
+///
 /// ENUMERATED / INTEGER value from a small BER content buffer.
 let private decodeSmallInt (bytes : byte array) : int option =
     match bytes.Length with
@@ -158,6 +182,7 @@ let private decodeSmallInt (bytes : byte array) : int option =
     | _ -> Some (foldBigEndianLength bytes)
 
 
+///
 /// Decode BER length at a buffer offset. Returns (contentStart, contentLen, nextPos) or None.
 let private decodeLengthAt (buf : byte array) (pos : int) : (int * int * int) option =
     match pos + 1 >= buf.Length with
@@ -179,6 +204,7 @@ let private decodeLengthAt (buf : byte array) (pos : int) : (int * int * int) op
                 Some (cs, len, cs + len)
 
 
+///
 /// Walk raw TLVs so ENUMERATED (0x0A) is not lost as BerRaw without a code path.
 let private readTlv (buf : byte array) (pos : int) : (byte * byte array * int) option =
     match pos >= buf.Length with
@@ -200,6 +226,7 @@ let private collectTlvs (buf : byte array) (pos : int) : (byte * byte array) lis
     loop pos []
 
 
+///
 /// Prefer APPLICATION 1 (BindResponse = 0x61) content; fall back to top SEQUENCE body.
 let private extractBindBody (top : (byte * byte array) list) (data : byte array) : byte array =
     let fromNestedSequence content =
@@ -208,7 +235,6 @@ let private extractBindBody (top : (byte * byte array) list) (data : byte array)
             match t2 with
             | 0x61uy -> Some c2
             | _ -> None)
-
     let fromTop =
         top
         |> List.tryPick (fun (tag, content) ->
@@ -216,7 +242,6 @@ let private extractBindBody (top : (byte * byte array) list) (data : byte array)
             | 0x61uy -> Some content
             | 0x30uy -> fromNestedSequence content
             | _ -> None)
-
     match fromTop with
     | Some body -> body
     | None ->
@@ -228,7 +253,6 @@ let private extractBindBody (top : (byte * byte array) list) (data : byte array)
 let private pickResultCode (fields : (byte * byte array) list) : int =
     fields
     |> List.tryPick (fun (tag, content) ->
-        // ENUMERATED (0x0A) preferred; INTEGER (0x02) accepted for robustness
         match tag with
         | 0x0Auy | 0x02uy -> decodeSmallInt content
         | _ -> None)
@@ -249,6 +273,7 @@ let private nthStringOrEmpty (strings : string list) (index : int) : string =
     | None -> ""
 
 
+///
 /// Unwrap serverSaslCreds [7] IMPLICIT OCTET STRING — primitive (0x87) or constructed (0xA7).
 let private pickServerSaslCreds (fields : (byte * byte array) list) : byte array option =
     fields
@@ -267,25 +292,22 @@ let internal parseBindResponse (data : byte array) : Result<LdapBindResult, Auth
         let top = collectTlvs data 0
         let fields = collectTlvs (extractBindBody top data) 0
         let strings = pickOctetStrings fields
-        Ok
-            { resultCode = pickResultCode fields
-              matchedDN = nthStringOrEmpty strings 0
-              diagnosticMessage = nthStringOrEmpty strings 1
-              serverSaslCreds = pickServerSaslCreds fields }
+        { resultCode = pickResultCode fields
+          matchedDN = nthStringOrEmpty strings 0
+          diagnosticMessage = nthStringOrEmpty strings 1
+          serverSaslCreds = pickServerSaslCreds fields } |> Ok
     with ex ->
-        Error (UnexpectedError $"Failed to parse LDAP BindResponse: {ex.Message}")
+        UnexpectedError $"Failed to parse LDAP BindResponse: {ex.Message}" |> Error
 
-// ---------------------------------------------------------------------------
-// Single bind round-trip: send SASL bind, parse BindResponse
-// ---------------------------------------------------------------------------
 
+///
 /// Continue after a successful send into receive + parse.
 let private receiveAndParseBind (stream : NetworkStream) (sendResult : Result<unit, AuthError>) : Result<LdapBindResult, AuthError> =
     match sendResult with
-    | Error e -> Error e
+    | Error e -> e |> Error
     | Ok () ->
         match receiveLdapMessage stream with
-        | Error e -> Error e
+        | Error e -> e |> Error
         | Ok response -> parseBindResponse response
 
 
@@ -306,23 +328,21 @@ let private sessionFromSuccess (stream : NetworkStream) (nextMessageId : int) (b
       NextMessageId = nextMessageId
       BoundAs = boundAsFromMatchedDn bindResult.matchedDN }
 
-// ---------------------------------------------------------------------------
-// Kerberos SASL bind (single-shot GSS-SPNEGO + AP-REQ)
-// ---------------------------------------------------------------------------
 
 let private buildKerberosSpnegoToken (authParams : KerberosTicketParams) : byte array =
     let (ServiceTicket ticketBytes) = authParams.serviceTicket
     buildSpnegoToken (buildApReqFromDomain ticketBytes authParams.sessionKey authParams.clientRealm authParams.clientName)
 
 
+///
 /// Map a Kerberos bind response onto session success or rejection.
 let private sessionFromKerberosBind (stream : NetworkStream) (bindResult : Result<LdapBindResult, AuthError>) : Result<LdapSession, AuthError> =
     match bindResult with
-    | Error e -> Error e
+    | Error e -> e |> Error
     | Ok br when br.resultCode = ldapSuccess ->
         sessionFromSuccess stream 2 br |> Ok
     | Ok _ ->
-        Error ProtocolAuthenticationRejected
+        ProtocolAuthenticationRejected |> Error
 
 
 let private performKerberosSaslBind (stream : NetworkStream) (authParams : KerberosTicketParams) : Result<LdapSession, AuthError> =
@@ -330,10 +350,8 @@ let private performKerberosSaslBind (stream : NetworkStream) (authParams : Kerbe
     |> exchangeSaslBind stream 1
     |> sessionFromKerberosBind stream
 
-// ---------------------------------------------------------------------------
-// NTLM SASL bind (two-leg GSS-SPNEGO: Type1 → challenge → Type3)
-// ---------------------------------------------------------------------------
 
+///
 /// Clamp a machine name into a 15-char NetBIOS-style workstation label.
 let private clampWorkstationName (name : string) : string =
     match String.IsNullOrWhiteSpace name with
@@ -342,14 +360,17 @@ let private clampWorkstationName (name : string) : string =
     | false -> name.Substring(0, 15).ToUpperInvariant()
 
 
+///
 /// Workstation name for NTLM — host-derived, not a hardcoded tool banner.
 let private ntlmWorkstationName () : string =
     try clampWorkstationName Environment.MachineName
     with _ -> "DESKTOP-FAULI"
 
 
+///
 /// LDAP SASL NTLM Type1 flags.
 /// IMPORTANT: Do NOT set NegotiateSign / NegotiateSeal / NegotiateKeyExch until a security-layer is implemented.
+/// 
 let private ldapNtlmType1Flags : uint32 =
     NtlmFlags.NegotiateUnicode
     ||| NtlmFlags.RequestTarget
@@ -361,6 +382,7 @@ let private ldapNtlmType1Flags : uint32 =
     ||| NtlmFlags.Negotiate56
 
 
+///
 /// Overwrite the flags DWORD at offset 12 of a Type1 message.
 let private overwriteNtlmFlags (buf : byte array) (flags : uint32) : byte array =
     match buf.Length >= 16 with
@@ -378,16 +400,19 @@ let private buildNtlmType1 (domain : string) (workstation : string) : byte array
     overwriteNtlmFlags msg ldapNtlmType1Flags
 
 
+///
 /// NTLMSSP signature bytes for scanning serverSaslCreds.
 let private ntlmSignature = Fauli.Constants.ntlmsspSignature
 
 
+///
 /// True when bytes start with the NTLMSSP signature and are long enough for Type2.
 let private looksLikeNtlmType2 (t : byte array) : bool =
     t.Length >= 32
     && t.[0..6] = [| 0x4Euy; 0x54uy; 0x4Cuy; 0x4Duy; 0x53uy; 0x53uy; 0x50uy |]
 
 
+///
 /// Scan buffer for NTLMSSP signature and return the tail from that offset.
 let private findNtlmPayload (serverSaslCreds : byte array) : byte array option =
     let rec loop i =
@@ -399,6 +424,7 @@ let private findNtlmPayload (serverSaslCreds : byte array) : byte array option =
     loop 0
 
 
+///
 /// Extract NTLMSSP Type2 bytes from serverSaslCreds (SPNEGO NegTokenResp or raw NTLM).
 let private extractNtlmType2 (serverSaslCreds : byte array) : byte array =
     let _, mechOpt = parseSnegoNegTokenResp serverSaslCreds
@@ -407,28 +433,30 @@ let private extractNtlmType2 (serverSaslCreds : byte array) : byte array =
     | _ -> defaultArg (findNtlmPayload serverSaslCreds) [||]
 
 
+///
 /// Require saslBindInProgress + serverSaslCreds on leg 1.
 let private requireSaslInProgress (leg1 : Result<LdapBindResult, AuthError>) : Result<byte array, AuthError> =
     match leg1 with
-    | Error e -> Error e
-    | Ok br when br.resultCode <> ldapSaslBindInProgress -> Error ProtocolAuthenticationRejected
+    | Error e -> e |> Error
+    | Ok br when br.resultCode <> ldapSaslBindInProgress -> 
+        ProtocolAuthenticationRejected |> Error
     | Ok br ->
         match br.serverSaslCreds with
-        | None -> Error ProtocolAuthenticationRejected
-        | Some creds -> Ok creds
+        | None -> ProtocolAuthenticationRejected |> Error
+        | Some creds -> creds |> Ok
 
 
+///
 /// Require a usable Type2 blob length.
 let private requireValidType2 (type2Bytes : byte array) : Result<byte array, AuthError> =
     match type2Bytes.Length < 32 with
-    | true -> Error ProtocolAuthenticationRejected
-    | false -> Ok type2Bytes
+    | true -> ProtocolAuthenticationRejected |> Error
+    | false -> type2Bytes |> Ok
 
 
+///
 /// Build Type3 SPNEGO token from challenge + password material.
 let private buildNtlmType3Token (password : string) (user : string) (domain : string) (workstation : string) (type1 : byte array) (type2Bytes : byte array) (challenge : ChallengeMessage) : byte array =
-    // Intersect server challenge flags with the LDAP Type1 set so we
-    // never accept Sign/Seal/KeyExch that Type1 did not offer.
     let type3Flags = challenge.negotiateFlags &&& ldapNtlmType1Flags
     let ntlmV2 = computeNtlmV2Response password user domain challenge
     let type3 =
@@ -437,33 +465,36 @@ let private buildNtlmType3Token (password : string) (user : string) (domain : st
     wrapNtlmNegTokenResp type3
 
 
+///
 /// Continue NTLM leg 2 after challenge parse.
 let private completeNtlmLeg2 (stream : NetworkStream) (password : string) (user : string) (domain : string) (workstation : string) (type1 : byte array) (type2Bytes : byte array) (challengeResult : Result<ChallengeMessage, AuthError>) : Result<LdapSession, AuthError> =
     match challengeResult with
-    | Error e -> Error e
+    | Error e -> e |> Error
     | Ok challenge ->
         let token3 = buildNtlmType3Token password user domain workstation type1 type2Bytes challenge
         match exchangeSaslBind stream 2 token3 with
-        | Error e -> Error e
+        | Error e -> e |> Error
         | Ok leg2 when leg2.resultCode = ldapSuccess ->
             sessionFromSuccess stream 3 leg2 |> Ok
         | Ok _ ->
-            Error ProtocolAuthenticationRejected
+            ProtocolAuthenticationRejected |> Error
 
 
+///
 /// After Type2 bytes are validated, parse challenge and finish leg 2.
 let private continueNtlmAfterType2 (stream : NetworkStream) (password : string) (user : string) (domain : string) (workstation : string) (type1 : byte array) (type2Result : Result<byte array, AuthError>) : Result<LdapSession, AuthError> =
     match type2Result with
-    | Error e -> Error e
+    | Error e -> e |> Error
     | Ok type2Bytes ->
         parseChallenge type2Bytes
         |> completeNtlmLeg2 stream password user domain workstation type1 type2Bytes
 
 
+///
 /// After leg-1 creds are accepted, extract Type2 and finish the NTLM bind.
 let private continueNtlmAfterLeg1Creds (stream : NetworkStream) (password : string) (user : string) (domain : string) (workstation : string) (type1 : byte array) (credsResult : Result<byte array, AuthError>) : Result<LdapSession, AuthError> =
     match credsResult with
-    | Error e -> Error e
+    | Error e -> e |> Error
     | Ok creds ->
         extractNtlmType2 creds
         |> requireValidType2
@@ -477,30 +508,26 @@ let private performNtlmSaslBind (stream : NetworkStream) (authParams : NtlmRespo
     let workstation = ntlmWorkstationName ()
     let type1 = buildNtlmType1 domain workstation
     let token1 = wrapNtlmSpnego type1
-
-    // Leg 1: NegTokenInit + NTLM Type1 → expect saslBindInProgress + serverSaslCreds
     exchangeSaslBind stream 1 token1
     |> requireSaslInProgress
     |> continueNtlmAfterLeg1Creds stream password user domain workstation type1
 
-// ---------------------------------------------------------------------------
-// Dispatch bind by auth params
-// ---------------------------------------------------------------------------
 
 let private dispatchSaslBind (stream : NetworkStream) (authParams : ProtocolHandlerParams) : Result<LdapSession, AuthError> =
     match authParams with
     | KerberosTicket krb -> performKerberosSaslBind stream krb
     | NtlmResponse ntlm -> performNtlmSaslBind stream ntlm
-    | _ -> Error NoSuitableAuthMethod
+    | _ -> NoSuitableAuthMethod |> Error
 
 
+///
 /// Own the stream on success; dispose on failure so sockets do not leak.
 let private retainStreamOnSuccess (stream : NetworkStream) (bindResult : Result<LdapSession, AuthError>) : Result<LdapSession, AuthError> =
     match bindResult with
-    | Ok session -> Ok session
+    | Ok session -> session |> Ok
     | Error e ->
         stream.Dispose()
-        Error e
+        e |> Error
 
 
 let private performLdapSaslBind (socket : Socket) (authParams : ProtocolHandlerParams) : Result<LdapSession, AuthError> =
@@ -508,9 +535,6 @@ let private performLdapSaslBind (socket : Socket) (authParams : ProtocolHandlerP
     dispatchSaslBind stream authParams
     |> retainStreamOnSuccess stream
 
-// ---------------------------------------------------------------------------
-// Supporting named steps
-// ---------------------------------------------------------------------------
 
 let private authMethodFromParams (authParams : ProtocolHandlerParams) : AuthenticationMethod =
     match authParams with
@@ -531,9 +555,6 @@ let private wrapLdapAuthenticatedResponse (session : LdapSession) (authParams : 
       authenticationMethod = authMethodFromParams authParams
       sessionInfo = emptySessionInfo }
 
-// ---------------------------------------------------------------------------
-// Connection setup
-// ---------------------------------------------------------------------------
 
 let private ldapPortForTransport (transport : LdapTransport) : int =
     match transport with
@@ -549,22 +570,20 @@ let private openLdapConnection (host : Host) (config : LdapConnectionConfig) : R
         socket.ReceiveTimeout <- config.connectTimeout
         socket.SendTimeout <- config.connectTimeout
         socket.Connect(hostStr, port)
-        Ok socket
+        socket |> Ok
     with
-    | :? SocketException -> Error ProtocolConnectionFailed
-    | ex -> Error (UnexpectedError $"LDAP connection failed: {ex.Message}")
+    | :? SocketException -> ProtocolConnectionFailed |> Error
+    | ex -> UnexpectedError $"LDAP connection failed: {ex.Message}" |> Error
 
-// ---------------------------------------------------------------------------
-// Public handler entry — composition of named steps
-// ---------------------------------------------------------------------------
 
+///
 /// After a live socket is open, bind and wrap the authenticated response.
 let private bindAndWrap (authParams : ProtocolHandlerParams) (socketResult : Result<Socket, AuthError>) : Result<AuthenticatedResponse, AuthError> =
     match socketResult with
-    | Error e -> Error e
+    | Error e -> e |> Error
     | Ok socket ->
         match performLdapSaslBind socket authParams with
-        | Error e -> Error e
+        | Error e -> e |> Error
         | Ok session -> wrapLdapAuthenticatedResponse session authParams |> Ok
 
 

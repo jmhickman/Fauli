@@ -1,5 +1,6 @@
 module Fauli.Solver
 
+
 open Fauli.Domain
 open Fauli.MethodSelection
 open Fauli.ServiceDiscovery
@@ -9,22 +10,13 @@ open Fauli.Smb.Handler
 open Fauli.Ldap.Handler
 
 
-// ---------------------------------------------------------------------------
-// Viable method selection
-// ---------------------------------------------------------------------------
-
+///
 /// Extract viable authentication methods from the request.
 let private selectViableMethods (request : AuthenticationRequest) : AuthenticationMethod list =
     selectMethods request.connectionType request.credential
 
-// ---------------------------------------------------------------------------
-// Kerberos authentication path.
-// Realm sources (priority):
-//   password     → UPN / DOMAIN\user on the credential, else kdcHost FQDN
-//   kirbi/ccache → TGT crealm embedded in the ticket, else kdcHost FQDN
-// KDC address may be a bare IP; spnHost must be an FQDN so SPN construction works.
-// ---------------------------------------------------------------------------
 
+///
 /// Username carried by a UserPassword credential, if any.
 let private userNameFromCredential (credential : Credential) : UserName option =
     match credential with
@@ -32,6 +24,7 @@ let private userNameFromCredential (credential : Credential) : UserName option =
     | _ -> None
 
 
+///
 /// Client principal bytes from an optional cname BER value.
 let private clientNameBytesFromCname (cname : Fauli.Kerberos.Parsing.BerValue option) : byte array =
     match cname with
@@ -39,6 +32,7 @@ let private clientNameBytesFromCname (cname : Fauli.Kerberos.Parsing.BerValue op
     | None -> [||]
 
 
+///
 /// Build KerberosTicketParams from a service ticket result.
 let private buildKerberosTicketParams (spn : ServiceName) (svcTicket : ServiceTicketResult) : ProtocolHandlerParams =
     let sessionKey = ServiceSessionKey (svcTicket.sessionKey.contents, int svcTicket.sessionKey.enctype)
@@ -50,13 +44,15 @@ let private buildKerberosTicketParams (spn : ServiceName) (svcTicket : ServiceTi
           clientRealm = defaultArg svcTicket.crealm "" }
 
 
+///
 /// Map a service-ticket Result into ProtocolHandlerParams.
 let private mapServiceTicketToParams (spn : ServiceName) (svcTicketResult : Result<ServiceTicketResult, AuthError>) : Result<ProtocolHandlerParams, AuthError> =
     match svcTicketResult with
-    | Error e -> Error e
-    | Ok svcTicket -> Ok (buildKerberosTicketParams spn svcTicket)
+    | Error e -> e |> Error
+    | Ok svcTicket -> buildKerberosTicketParams spn svcTicket |> Ok
 
 
+///
 /// TGS exchange: TGT + SPN + realm → ProtocolHandlerParams.
 let private acquireServiceTicketParams (kdcHost : string) (spn : ServiceName) (realmStr : string) (tgt : TgtResult) : Result<ProtocolHandlerParams, AuthError> =
     let (ServiceName spnStr) = spn
@@ -64,13 +60,15 @@ let private acquireServiceTicketParams (kdcHost : string) (spn : ServiceName) (r
     |> mapServiceTicketToParams spn
 
 
+///
 /// Password material required for AS-REQ, or NoSuitableAuthMethod.
 let private passwordCredentialFromRequest (request : AuthenticationRequest) : Result<UserNamePassword, AuthError> =
     match request.credential with
-    | UserPassword creds -> Ok creds
-    | _ -> Error NoSuitableAuthMethod
+    | UserPassword creds -> creds |> Ok
+    | _ -> NoSuitableAuthMethod |> Error
 
 
+///
 /// Acquire TGT then service ticket for a password credential and resolved realm.
 let private passwordKerberosWithRealm (request : AuthenticationRequest) (creds : UserNamePassword) (realm : KerberosRealm) : Result<ProtocolHandlerParams, AuthError> =
     let (Host kdcHost) = request.kdcHost
@@ -78,35 +76,40 @@ let private passwordKerberosWithRealm (request : AuthenticationRequest) (creds :
     let (Password password) = creds.password
     let spn = serviceNameFor request.connectionType request.spnHost realm
     let principal = principalNameFromUserName creds.userName
+    
     match getTgt kdcHost principal password realmStr with
-    | Error e -> Error e
+    | Error e -> e |> Error
     | Ok tgt -> acquireServiceTicketParams kdcHost spn realmStr tgt
 
 
+///
 /// Password Kerberos: short principal + realm → TGT → service ticket.
 let private tryKerberosPassword (request : AuthenticationRequest) (realm : KerberosRealm) : Result<ProtocolHandlerParams, AuthError> =
     match passwordCredentialFromRequest request with
-    | Error e -> Error e
+    | Error e -> e |> Error
     | Ok creds -> passwordKerberosWithRealm request creds realm
 
 
+///
 /// Continue password Kerberos after realm resolution.
 let private continuePasswordKerberos (request : AuthenticationRequest) (realmResult : Result<KerberosRealm, AuthError>) : Result<ProtocolHandlerParams, AuthError> =
     match realmResult with
-    | Error e -> Error e
+    | Error e -> e |> Error
     | Ok realm -> tryKerberosPassword request realm
 
 
+///
 /// Derive realm (credential-first) then run password Kerberos.
 let private tryKerberos (request : AuthenticationRequest) : Result<ProtocolHandlerParams, AuthError> =
     resolveRealm (userNameFromCredential request.credential) request.kdcHost
     |> continuePasswordKerberos request
 
 
+///
 /// After a TGT is in hand, resolve realm from the ticket, build SPN, acquire service ticket.
 let private continueWithTgt (request : AuthenticationRequest) (tgt : TgtResult) : Result<ProtocolHandlerParams, AuthError> =
     match resolveRealmFromTgtCrealm tgt.crealm request.kdcHost with
-    | Error e -> Error e
+    | Error e -> e |> Error
     | Ok realm ->
         let (Host kdcHost) = request.kdcHost
         let (KerberosRealm realmStr) = realm
@@ -114,35 +117,37 @@ let private continueWithTgt (request : AuthenticationRequest) (tgt : TgtResult) 
         acquireServiceTicketParams kdcHost spn realmStr tgt
 
 
+///
 /// Continue after TGT extraction from ticket material.
 let private continueAfterTgtExtraction (request : AuthenticationRequest) (tgtResult : Result<TgtResult, AuthError>) : Result<ProtocolHandlerParams, AuthError> =
     match tgtResult with
-    | Error e -> Error e
+    | Error e -> e |> Error
     | Ok tgt -> continueWithTgt request tgt
 
 
+///
 /// Authenticate using a .kirbi Kerberos ticket file.
 /// Realm is harvested from the TGT crealm when present — host FQDN is only a fallback.
+/// 
 let private tryKerberosKirbi (request : AuthenticationRequest) (kirbi : Kirbi) : Result<ProtocolHandlerParams, AuthError> =
     Kirbi.rawData kirbi
     |> extractTgtFromKirbi
     |> continueAfterTgtExtraction request
 
 
+///
 /// Authenticate using a .ccache credential cache file.
 /// Realm is harvested from the TGT crealm when present — host FQDN is only a fallback.
+/// 
 let private tryKerberosCcache (request : AuthenticationRequest) (ccache : Ccache) : Result<ProtocolHandlerParams, AuthError> =
     Ccache.rawData ccache
     |> extractTgtFromCcache
     |> continueAfterTgtExtraction request
 
-// ---------------------------------------------------------------------------
-// NetNTLMv2 authentication path.
-// ---------------------------------------------------------------------------
 
+///
 /// Package resolved NTLM identity material for protocol handlers.
 let private packageNtlmParams (creds : UserNamePassword) (domain : DomainName) : ProtocolHandlerParams =
-    // Handlers expect the short principal, not user@domain / DOMAIN\user.
     let shortName = principalNameFromUserName creds.userName
     NtlmResponse
         { authResponse = NtlmAuthResponse [||]
@@ -151,35 +156,34 @@ let private packageNtlmParams (creds : UserNamePassword) (domain : DomainName) :
           password = creds.password }
 
 
+///
 /// Continue NetNTLMv2 after domain resolution.
 let private continueNtlmAfterDomain (creds : UserNamePassword) (domainResult : Result<DomainName, AuthError>) : Result<ProtocolHandlerParams, AuthError> =
     match domainResult with
-    | Error e -> Error e
-    | Ok domain -> Ok (packageNtlmParams creds domain)
+    | Error e -> e |> Error
+    | Ok domain -> packageNtlmParams creds domain |> Ok
 
 
+///
 /// Package NTLM credentials for protocol handlers.
 /// SMB (and similar) perform Type1→Type2→Type3 on the protocol connection using the password;
 /// a separate raw-TCP NTLM exchange cannot supply the correct server challenge.
+/// 
 let private tryNetNtlmV2 (request : AuthenticationRequest) : Result<ProtocolHandlerParams, AuthError> =
     match request.credential with
     | UserPassword creds ->
         resolveDomain (Some creds.userName) request.kdcHost
         |> continueNtlmAfterDomain creds
-    | _ -> Error NoSuitableAuthMethod
+    | _ -> NoSuitableAuthMethod |> Error
 
-// ---------------------------------------------------------------------------
-// NetNTLMv1 authentication path (not yet implemented).
-// ---------------------------------------------------------------------------
 
+///
 /// NetNTLMv1 is not yet supported; always returns an error.
 let private tryNetNtlmV1 (_ : AuthenticationRequest) : Result<ProtocolHandlerParams, AuthError> =
-    Error NtlmVersionNotSupported
+    NtlmVersionNotSupported |> Error
 
-// ---------------------------------------------------------------------------
-// Method dispatcher
-// ---------------------------------------------------------------------------
 
+///
 /// Kerberos dispatch: ticket material vs password path.
 let private attemptKerberos (request : AuthenticationRequest) : Result<ProtocolHandlerParams, AuthError> =
     match request.credential with
@@ -188,75 +192,72 @@ let private attemptKerberos (request : AuthenticationRequest) : Result<ProtocolH
     | _ -> tryKerberos request
 
 
+///
 /// Dispatch an AuthenticationMethod to its solver function.
 let private attemptMethod (method : AuthenticationMethod) (request : AuthenticationRequest) : Result<ProtocolHandlerParams, AuthError> =
     match method with
     | Kerberos -> attemptKerberos request
     | NetNTLMv2 -> tryNetNtlmV2 request
     | NetNTLMv1 -> tryNetNtlmV1 request
-    | _ -> Error NoSuitableAuthMethod
+    | _ -> NoSuitableAuthMethod |> Error
 
-// ---------------------------------------------------------------------------
-// Try methods sequentially (first success wins, last error otherwise)
-// ---------------------------------------------------------------------------
 
+///
 /// Collapse the sequential attempt outcome when the method list is exhausted.
 let private finalizeMethodAttempts (lastError : AuthError option) : Result<ProtocolHandlerParams, AuthError> =
     match lastError with
-    | Some e -> Error e
-    | None -> Error NoSuitableAuthMethod
+    | Some e -> e |> Error
+    | None -> NoSuitableAuthMethod |> Error
 
 
+///
 /// Try a list of authentication methods sequentially.
 /// Returns the first success, or the last error encountered.
+/// 
 let private tryMethodsSequentially (request : AuthenticationRequest) (methods : AuthenticationMethod list) : Result<ProtocolHandlerParams, AuthError> =
     let rec loop (remaining : AuthenticationMethod list) (lastError : AuthError option) : Result<ProtocolHandlerParams, AuthError> =
         match remaining with
         | [] -> finalizeMethodAttempts lastError
         | method :: rest ->
             match attemptMethod method request with
-            | Ok result -> Ok result
+            | Ok result -> result |> Ok
             | Error e -> loop rest (Some e)
     loop methods None
 
-// ---------------------------------------------------------------------------
-// Produce params from the selected authentication method.
-// ---------------------------------------------------------------------------
 
+///
 /// Named step: select viable methods and try each in order.
 /// All monadic logic lives inside this function and its callees.
+/// 
 let private produceProtocolHandlerParams (request : AuthenticationRequest) : Result<ProtocolHandlerParams, AuthError> =
     request
     |> selectViableMethods
     |> tryMethodsSequentially request
 
-// ---------------------------------------------------------------------------
-// Execute the protocol handler step using the produced params
-// The handler performs the actual authenticated connection for the ConnectionType.
-// ---------------------------------------------------------------------------
 
+///
 /// Named step: given a request and params, dispatch to the concrete handler
 /// for the connection type. This completes the authentication and returns
 /// the live connection handle.
+/// 
 let private executeAuthenticatedConnection (request : AuthenticationRequest) (authParams : ProtocolHandlerParams) : Result<AuthenticatedResponse, AuthError> =
     match request.connectionType with
     | SMB -> handleSmb request.connectHost authParams
     | Ldap config -> handleLdap request.connectHost config authParams
-    | _ -> Error UnsupportedConnectionType
+    | _ -> UnsupportedConnectionType |> Error
 
 
+///
 /// Named step that bridges the Result from param production into execution.
 /// All Result handling is encapsulated here.
+/// 
 let private continueAfterParams (request : AuthenticationRequest) (paramsResult : Result<ProtocolHandlerParams, AuthError>) : Result<AuthenticatedResponse, AuthError> =
     match paramsResult with
     | Ok p -> executeAuthenticatedConnection request p
-    | Error e -> Error e
+    | Error e -> e |> Error
 
-// ---------------------------------------------------------------------------
-// Public API (the one and only call)
-// Shape matches Domain.Authenticate exactly.
-// ---------------------------------------------------------------------------
 
+///
 /// <summary>
 /// Public entry point for Fauli. Given an <see cref="T:Fauli.Domain.AuthenticationRequest"/>,
 /// selects a viable authentication method, obtains the necessary auth material, opens an
@@ -394,51 +395,14 @@ let private continueAfterParams (request : AuthenticationRequest) (paramsResult 
 ///   </item>
 /// </list>
 ///
-/// <para><b>Recommended configurations</b></para>
-/// <code>
-/// // Kerberos with IP KDC; TCP to IP, SPN from FQDN (recommended for LDAP/SMB)
-/// { connectionType = SMB  // or Ldap LdapConnectionConfig.defaults
-///   credential = UserPassword { userName = UserName "Administrator@AD-LAB.LOCAL"
-///                               password = Password "…" }
-///   kdcHost = Host "192.168.10.38"                    // KDC
-///   connectHost = Host "192.168.10.38"                // TCP connect target
-///   spnHost = Host "AD-Server-01.ad-lab.local" }      // Kerberos SPN
 ///
-/// // All three hosts the same (legacy equivalent)
-/// { connectionType = SMB
-///   credential = UserPassword { userName = UserName "Administrator"
-///                               password = Password "…" }
-///   kdcHost = Host "dc.ad-lab.local"
-///   connectHost = Host "dc.ad-lab.local"
-///   spnHost = Host "dc.ad-lab.local" }
-///
-/// // Existing TGT (realm from ticket crealm)
-/// { … credential = KerberosKirbi kirbi  // or KerberosCcache ccache
-///     kdcHost = Host "192.168.10.38"
-///     connectHost = Host "AD-Server-01.ad-lab.local"
-///     spnHost = Host "AD-Server-01.ad-lab.local" }
-///
-/// // NTLMv2 when Kerberos cannot win (e.g. after Kerberos fails); still needs domain:
-/// // UPN, DOMAIN\\\\user, or FQDN kdcHost — not plain user + bare IP alone.
-/// </code>
-///
-/// <para><b>Success</b></para>
-/// <c>Ok { connection; authenticationMethod; sessionInfo }</c> where <c>authenticationMethod</c>
-/// is the method that actually succeeded (<c>Kerberos</c> or <c>NetNTLMv2</c> today). The caller
-/// owns the connection handle and must dispose underlying streams when finished.
-///
-/// <para><b>Common errors</b></para>
-/// <c>NoSuitableAuthMethod</c>, <c>UnsupportedConnectionType</c>,
-/// <c>KerberosRealmUnreachable</c>, <c>KerberosTGTAcquisitionFailed</c>, <c>KerberosTGTExpired</c>,
-/// <c>KerberosServiceTicketFailed</c>, <c>NtlmDomainNotFound</c>, <c>NtlmVersionNotSupported</c>,
-/// <c>ProtocolConnectionFailed</c>, <c>ProtocolHandshakeFailed</c>,
-/// <c>ProtocolAuthenticationRejected</c>, <c>UnexpectedError</c>.
 /// </remarks>
 ///
 /// <param name="request">Fully populated authentication request (protocol, credential, hosts).</param>
 /// <returns>
 /// <c>Ok AuthenticatedResponse</c> with a live protocol session, or <c>Error AuthError</c>.
 /// </returns>
+/// 
 let authenticate (request : AuthenticationRequest) : Result<AuthenticatedResponse, AuthError> =
     request
     |> produceProtocolHandlerParams
