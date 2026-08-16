@@ -17,6 +17,7 @@
     <Compile Include="SmbSigningTests.fs" />
     <Compile Include="ServiceDiscoveryTests.fs" />
     <Compile Include="LdapWireTests.fs" />
+    <Compile Include="LdapTlsTests.fs" />
     <Compile Include="SolverPureTests.fs" />
   </ItemGroup>
 
