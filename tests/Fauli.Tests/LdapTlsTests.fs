@@ -75,10 +75,10 @@ let private readByte (stream : Stream) : int =
 /// Read a definite BER length (short or long form) after the tag byte.
 let private readBerLength (stream : Stream) : int =
     let first = readByte stream
-    match (first - (first / 128) * 128) = 0 with
+    match (first &&& 0x7F) = 0 with
     | true -> first
     | false ->
-        let count = first - (first / 128) * 128
+        let count = first &&& 0x7F
         let rec foldLen acc remaining =
             match remaining = 0 with
             | true -> acc
