@@ -2,6 +2,7 @@ module Fauli.Domain
 
 
 open System
+open System.IO
 open System.Net.Sockets
 open System.Net.Http
 open System.Security.Cryptography.X509Certificates
@@ -264,10 +265,10 @@ let internal smbDialectCode (d : SmbDialect) : uint16 =
 /// 
 type LdapSession =
     { ///
-      /// The underlying bidirectional TCP stream for LDAP BER messages.
+      /// The underlying bidirectional stream for LDAP BER messages (plain TCP or TLS).
       /// The bind response has already been read from this stream.
       /// 
-      Stream : NetworkStream
+      Stream : Stream
       ///
       /// The message ID the caller must use for the first operation after the bind.
       /// Fauli uses message ID 1 for the SASL bind request.

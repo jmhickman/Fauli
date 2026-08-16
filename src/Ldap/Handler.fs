@@ -1,7 +1,10 @@
 module internal Fauli.Ldap.Handler
 
 open System
+open System.IO
+open System.Net.Security
 open System.Net.Sockets
+open System.Security.Authentication
 open System.Text
 
 open Fauli.Domain
@@ -61,7 +64,7 @@ let private mapLdapIoException (action : string) (ex : exn) : AuthError =
     | _ -> UnexpectedError $"LDAP {action} failed: {ex.Message}"
 
 
-let private sendLdapRequest (stream : NetworkStream) (message : byte array) : Result<unit, AuthError> =
+let private sendLdapRequest (stream : Stream) (message : byte array) : Result<unit, AuthError> =
     try
         stream.Write(message, 0, message.Length)
         stream.Flush()
@@ -72,7 +75,7 @@ let private sendLdapRequest (stream : NetworkStream) (message : byte array) : Re
 
 ///
 /// Read one stream byte as Option (None = EOF).
-let private tryReadByte (stream : NetworkStream) : int option =
+let private tryReadByte (stream : Stream) : int option =
     match stream.ReadByte() with
     | b when b < 0 -> None
     | b -> Some b
@@ -87,7 +90,7 @@ let private foldBigEndianLength (bytes : byte array) : int =
 
 ///
 /// Fill a buffer from the stream; false on EOF before complete.
-let private tryFillBuffer (stream : NetworkStream) (buffer : byte array) : bool =
+let private tryFillBuffer (stream : Stream) (buffer : byte array) : bool =
     let rec loop off rem =
         match rem <= 0 with
         | true -> true
@@ -102,7 +105,7 @@ let private tryFillBuffer (stream : NetworkStream) (buffer : byte array) : bool 
 /// Decode definite BER length after the first length octet has been read.
 /// Returns (length-prefix-bytes including first octet, content length) or None.
 /// 
-let private decodeBerLengthPrefix (stream : NetworkStream) (lenFirst : int) : (byte array * int) option =
+let private decodeBerLengthPrefix (stream : Stream) (lenFirst : int) : (byte array * int) option =
     match lenFirst &&& 0x80 = 0 with
     | true -> Some ([| byte lenFirst |], lenFirst)
     | false ->
@@ -125,7 +128,7 @@ let private assembleBerMessage (tag : int) (lengthPrefix : byte array) (content 
 
 ///
 /// Read one stream byte as Result (EOF = ProtocolConnectionFailed).
-let private readByteOrFail (stream : NetworkStream) : Result<int, AuthError> =
+let private readByteOrFail (stream : Stream) : Result<int, AuthError> =
     match tryReadByte stream with
     | None -> ProtocolConnectionFailed |> Error
     | Some b -> b |> Ok
@@ -133,7 +136,7 @@ let private readByteOrFail (stream : NetworkStream) : Result<int, AuthError> =
 
 ///
 /// Decode a definite BER length prefix from the stream as a Result.
-let private readBerLength (stream : NetworkStream) : Result<byte array * int, AuthError> =
+let private readBerLength (stream : Stream) : Result<byte array * int, AuthError> =
     match readByteOrFail stream with
     | Error e -> e |> Error
     | Ok lenFirst ->
@@ -145,7 +148,7 @@ let private readBerLength (stream : NetworkStream) : Result<byte array * int, Au
 
 ///
 /// Read exactly len content bytes from the stream as a Result.
-let private readContentOrFail (stream : NetworkStream) (len : int) : Result<byte array, AuthError> =
+let private readContentOrFail (stream : Stream) (len : int) : Result<byte array, AuthError> =
     let content = Array.zeroCreate<byte> len
     match tryFillBuffer stream content with
     | false -> ProtocolConnectionFailed |> Error
@@ -154,7 +157,7 @@ let private readContentOrFail (stream : NetworkStream) (len : int) : Result<byte
 
 ///
 /// Read one complete BER TLV from the stream (tag + length octets + content).
-let private receiveLdapMessage (stream : NetworkStream) : Result<byte array, AuthError> =
+let private receiveLdapMessage (stream : Stream) : Result<byte array, AuthError> =
     try
         match readByteOrFail stream with
         | Error e -> e |> Error
@@ -302,7 +305,7 @@ let internal parseBindResponse (data : byte array) : Result<LdapBindResult, Auth
 
 ///
 /// Continue after a successful send into receive + parse.
-let private receiveAndParseBind (stream : NetworkStream) (sendResult : Result<unit, AuthError>) : Result<LdapBindResult, AuthError> =
+let private receiveAndParseBind (stream : Stream) (sendResult : Result<unit, AuthError>) : Result<LdapBindResult, AuthError> =
     match sendResult with
     | Error e -> e |> Error
     | Ok () ->
@@ -311,7 +314,7 @@ let private receiveAndParseBind (stream : NetworkStream) (sendResult : Result<un
         | Ok response -> parseBindResponse response
 
 
-let private exchangeSaslBind (stream : NetworkStream) (messageId : int) (spnegoToken : byte array) : Result<LdapBindResult, AuthError> =
+let private exchangeSaslBind (stream : Stream) (messageId : int) (spnegoToken : byte array) : Result<LdapBindResult, AuthError> =
     buildSaslBindRequest messageId spnegoToken
     |> sendLdapRequest stream
     |> receiveAndParseBind stream
@@ -323,7 +326,7 @@ let private boundAsFromMatchedDn (matchedDN : string) : string option =
     | false -> Some matchedDN
 
 
-let private sessionFromSuccess (stream : NetworkStream) (nextMessageId : int) (bindResult : LdapBindResult) : LdapSession =
+let private sessionFromSuccess (stream : Stream) (nextMessageId : int) (bindResult : LdapBindResult) : LdapSession =
     { Stream = stream
       NextMessageId = nextMessageId
       BoundAs = boundAsFromMatchedDn bindResult.matchedDN }
@@ -336,7 +339,7 @@ let private buildKerberosSpnegoToken (authParams : KerberosTicketParams) : byte 
 
 ///
 /// Map a Kerberos bind response onto session success or rejection.
-let private sessionFromKerberosBind (stream : NetworkStream) (bindResult : Result<LdapBindResult, AuthError>) : Result<LdapSession, AuthError> =
+let private sessionFromKerberosBind (stream : Stream) (bindResult : Result<LdapBindResult, AuthError>) : Result<LdapSession, AuthError> =
     match bindResult with
     | Error e -> e |> Error
     | Ok br when br.resultCode = ldapSuccess ->
@@ -345,7 +348,7 @@ let private sessionFromKerberosBind (stream : NetworkStream) (bindResult : Resul
         ProtocolAuthenticationRejected |> Error
 
 
-let private performKerberosSaslBind (stream : NetworkStream) (authParams : KerberosTicketParams) : Result<LdapSession, AuthError> =
+let private performKerberosSaslBind (stream : Stream) (authParams : KerberosTicketParams) : Result<LdapSession, AuthError> =
     buildKerberosSpnegoToken authParams
     |> exchangeSaslBind stream 1
     |> sessionFromKerberosBind stream
@@ -467,7 +470,7 @@ let private buildNtlmType3Token (password : string) (user : string) (domain : st
 
 ///
 /// Continue NTLM leg 2 after challenge parse.
-let private completeNtlmLeg2 (stream : NetworkStream) (password : string) (user : string) (domain : string) (workstation : string) (type1 : byte array) (type2Bytes : byte array) (challengeResult : Result<ChallengeMessage, AuthError>) : Result<LdapSession, AuthError> =
+let private completeNtlmLeg2 (stream : Stream) (password : string) (user : string) (domain : string) (workstation : string) (type1 : byte array) (type2Bytes : byte array) (challengeResult : Result<ChallengeMessage, AuthError>) : Result<LdapSession, AuthError> =
     match challengeResult with
     | Error e -> e |> Error
     | Ok challenge ->
@@ -482,7 +485,7 @@ let private completeNtlmLeg2 (stream : NetworkStream) (password : string) (user 
 
 ///
 /// After Type2 bytes are validated, parse challenge and finish leg 2.
-let private continueNtlmAfterType2 (stream : NetworkStream) (password : string) (user : string) (domain : string) (workstation : string) (type1 : byte array) (type2Result : Result<byte array, AuthError>) : Result<LdapSession, AuthError> =
+let private continueNtlmAfterType2 (stream : Stream) (password : string) (user : string) (domain : string) (workstation : string) (type1 : byte array) (type2Result : Result<byte array, AuthError>) : Result<LdapSession, AuthError> =
     match type2Result with
     | Error e -> e |> Error
     | Ok type2Bytes ->
@@ -492,7 +495,7 @@ let private continueNtlmAfterType2 (stream : NetworkStream) (password : string) 
 
 ///
 /// After leg-1 creds are accepted, extract Type2 and finish the NTLM bind.
-let private continueNtlmAfterLeg1Creds (stream : NetworkStream) (password : string) (user : string) (domain : string) (workstation : string) (type1 : byte array) (credsResult : Result<byte array, AuthError>) : Result<LdapSession, AuthError> =
+let private continueNtlmAfterLeg1Creds (stream : Stream) (password : string) (user : string) (domain : string) (workstation : string) (type1 : byte array) (credsResult : Result<byte array, AuthError>) : Result<LdapSession, AuthError> =
     match credsResult with
     | Error e -> e |> Error
     | Ok creds ->
@@ -501,7 +504,7 @@ let private continueNtlmAfterLeg1Creds (stream : NetworkStream) (password : stri
         |> continueNtlmAfterType2 stream password user domain workstation type1
 
 
-let private performNtlmSaslBind (stream : NetworkStream) (authParams : NtlmResponseParams) : Result<LdapSession, AuthError> =
+let private performNtlmSaslBind (stream : Stream) (authParams : NtlmResponseParams) : Result<LdapSession, AuthError> =
     let (UserName user) = authParams.userName
     let (DomainName domain) = authParams.domain
     let (Password password) = authParams.password
@@ -513,7 +516,7 @@ let private performNtlmSaslBind (stream : NetworkStream) (authParams : NtlmRespo
     |> continueNtlmAfterLeg1Creds stream password user domain workstation type1
 
 
-let private dispatchSaslBind (stream : NetworkStream) (authParams : ProtocolHandlerParams) : Result<LdapSession, AuthError> =
+let private dispatchSaslBind (stream : Stream) (authParams : ProtocolHandlerParams) : Result<LdapSession, AuthError> =
     match authParams with
     | KerberosTicket krb -> performKerberosSaslBind stream krb
     | NtlmResponse ntlm -> performNtlmSaslBind stream ntlm
@@ -522,7 +525,7 @@ let private dispatchSaslBind (stream : NetworkStream) (authParams : ProtocolHand
 
 ///
 /// Own the stream on success; dispose on failure so sockets do not leak.
-let private retainStreamOnSuccess (stream : NetworkStream) (bindResult : Result<LdapSession, AuthError>) : Result<LdapSession, AuthError> =
+let private retainStreamOnSuccess (stream : Stream) (bindResult : Result<LdapSession, AuthError>) : Result<LdapSession, AuthError> =
     match bindResult with
     | Ok session -> session |> Ok
     | Error e ->
@@ -530,10 +533,59 @@ let private retainStreamOnSuccess (stream : NetworkStream) (bindResult : Result<
         e |> Error
 
 
-let private performLdapSaslBind (socket : Socket) (authParams : ProtocolHandlerParams) : Result<LdapSession, AuthError> =
-    let stream = new NetworkStream(socket, ownsSocket = true)
-    dispatchSaslBind stream authParams
-    |> retainStreamOnSuccess stream
+///
+/// Map a TLS handshake exception onto an AuthError.
+let private mapTlsException (ex : exn) : AuthError =
+    match ex with
+    | :? AuthenticationException -> ProtocolHandshakeFailed
+    | :? SocketException -> ProtocolConnectionFailed
+    | :? IOException -> ProtocolConnectionFailed
+    | _ -> UnexpectedError $"LDAPS handshake failed: {ex.Message}"
+
+
+///
+/// Perform the implicit-TLS client handshake on a plain stream.
+/// Returns the authenticated SslStream (as Stream) on success.
+/// Fauli is a pentesting library and does not validate server identity:
+/// the LDAPS server certificate is always accepted.
+let internal authenticateTls (host : Host) (stream : Stream) : Result<Stream, AuthError> =
+    let (Host hostStr) = host
+    try
+        let sslStream = new SslStream(stream, false, (fun _ _ _ _ -> true))
+        sslStream.AuthenticateAsClient hostStr
+        (sslStream : Stream) |> Ok
+    with ex ->
+        mapTlsException ex |> Error
+
+
+///
+/// Named step: given an open socket, produce the transport stream for the configured
+/// transport. LdapPlain → plain NetworkStream. LdapTls → SslStream after the client handshake.
+let private transportStreamFor (host : Host) (config : LdapConnectionConfig) (socket : Socket) : Result<Stream, AuthError> =
+    let networkStream = new NetworkStream(socket, ownsSocket = true)
+    match config.transport with
+    | LdapPlain -> (networkStream : Stream) |> Ok
+    | LdapTls -> authenticateTls host networkStream
+
+
+///
+/// Named step: wrap the open socket in a transport stream. All Result handling lives here;
+/// the transport-specific work is delegated to transportStreamFor.
+let internal establishTransportStream (host : Host) (config : LdapConnectionConfig) (socketResult : Result<Socket, AuthError>) : Result<Stream, AuthError> =
+    match socketResult with
+    | Error e -> e |> Error
+    | Ok socket -> transportStreamFor host config socket
+
+
+///
+/// Named step: run the SASL bind over an established transport stream.
+/// Owns the stream on success; disposes it on failure so sockets do not leak.
+let private performSaslBind (authParams : ProtocolHandlerParams) (streamResult : Result<Stream, AuthError>) : Result<LdapSession, AuthError> =
+    match streamResult with
+    | Error e -> e |> Error
+    | Ok stream ->
+        dispatchSaslBind stream authParams
+        |> retainStreamOnSuccess stream
 
 
 let private authMethodFromParams (authParams : ProtocolHandlerParams) : AuthenticationMethod =
@@ -577,16 +629,15 @@ let private openLdapConnection (host : Host) (config : LdapConnectionConfig) : R
 
 
 ///
-/// After a live socket is open, bind and wrap the authenticated response.
-let private bindAndWrap (authParams : ProtocolHandlerParams) (socketResult : Result<Socket, AuthError>) : Result<AuthenticatedResponse, AuthError> =
-    match socketResult with
+/// Named step: wrap a bound session into the authenticated response.
+let private wrapLdapResponse (authParams : ProtocolHandlerParams) (sessionResult : Result<LdapSession, AuthError>) : Result<AuthenticatedResponse, AuthError> =
+    match sessionResult with
     | Error e -> e |> Error
-    | Ok socket ->
-        match performLdapSaslBind socket authParams with
-        | Error e -> e |> Error
-        | Ok session -> wrapLdapAuthenticatedResponse session authParams |> Ok
+    | Ok session -> wrapLdapAuthenticatedResponse session authParams |> Ok
 
 
 let internal handleLdap (host : Host) (config : LdapConnectionConfig) (authParams : ProtocolHandlerParams) : Result<AuthenticatedResponse, AuthError> =
     openLdapConnection host config
-    |> bindAndWrap authParams
+    |> establishTransportStream host config
+    |> performSaslBind authParams
+    |> wrapLdapResponse authParams
