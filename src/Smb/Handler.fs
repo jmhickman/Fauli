@@ -3,7 +3,6 @@ module internal Fauli.Smb.Handler
 
 open System
 open System.Net.Sockets
-open System.Text
 
 open Fauli.Domain
 open Fauli.Kerberos.Auth
@@ -23,20 +22,10 @@ type SmbNegotiateState =
       dialect : uint16
       serverGuid : byte array
       capabilities : uint32
-      ///
-      /// SecurityMode from the negotiate response (bit 0 = enabled, bit 1 = required).
       securityMode : uint16
-      ///
-      /// Negotiated CipherId (SMB 3.x). Defaults to AES-128-CCM when encryption is supported.
       cipherId : uint16
-      ///
-      /// Running SMB 3.1.1 preauth integrity hash (SHA-512 chain). Empty for other dialects.
       preauthHash : byte array
-      ///
-      /// Raw negotiate request bytes.
       negotiateRequestRaw : byte array
-      ///
-      /// Raw negotiate response bytes.
       negotiateResponseRaw : byte array }
 
 
@@ -46,15 +35,46 @@ type SmbSessionState =
     { stream : NetworkStream
       sessionId : uint64
       dialect : uint16
-      ///
-      /// The Kerberos/NTLM session key (SMB2.x signing material / SMB3.x KDF input).
       sessionKey : byte array
-      ///
-      /// Derived signing key (Some for SMB3.x, None for SMB2.x).
       signingKey : byte array option
-      ///
-      /// SMB3 transform encryption (Some when SessionFlags.ENCRYPT_DATA or SMB3+cap).
       encryption : SmbEncryption option }
+
+
+///
+/// Partial fill of a stream read into a fixed buffer.
+type private ReadCursor =
+    { buffer : byte array
+      offset : int
+      remaining : int }
+
+
+///
+/// NetBIOS session header: a message we want, or a frame to skip (keep-alive, etc.).
+type private NetbiosFrame =
+    | SessionMessage of int
+    | SkipFrame
+
+
+///
+/// Cursor over SMB2 negotiate contexts while searching for ENCRYPTION_CAPABILITIES.
+type private ContextCursor =
+    { response : byte array
+      remaining : int
+      offset : int }
+
+
+///
+/// NTLM Type1 exchange plus identity, threaded through Type2/Type3 SESSION_SETUP.
+type private NtlmSetup =
+    { state : SmbNegotiateState
+      user : string
+      domain : string
+      password : string
+      workstation : string
+      type1 : byte array
+      sessionId1 : uint64
+      req1 : byte array
+      resp1 : byte array }
 
 
 ///
@@ -167,6 +187,7 @@ let private fillSmb2Header (command : uint16) (messageId : uint64) (sessionId : 
     Array.Copy(le32 0xFEFFu, 0, h, 32, 4)
     Array.Copy(le32 treeId, 0, h, 36, 4)
     Array.Copy(le64 sessionId, 0, h, 40, 8)
+    
     h
 
 
@@ -189,48 +210,51 @@ let private parseSmb2Status (header : byte array) : uint32 =
 /// Wrap data in a NetBIOS Session Message header (type=0x00, 3-byte big-endian length).
 let internal wrapNetbiosMessage (data : byte array) : byte array =
     let len = data.Length
-    let header = Array.zeroCreate<byte> 4
-    header.[0] <- 0x00uy                          // NetBIOS Session Message type
-    header.[1] <- byte (len >>> 16)               // Length high byte (BE)
-    header.[2] <- byte ((len >>> 8) &&& 0xFF)     // Length mid byte (BE)
-    header.[3] <- byte (len &&& 0xFF)             // Length low byte (BE)
-    Array.concat [| header; data |]
+    [|[| 0x00uy; byte (len >>> 16); byte (len >>> 8 &&& 0xFF); byte (len &&& 0xFF) |]; data|]
+    |> Array.concat
 
 
 ///
-/// Read a NetBIOS Session Message from the stream: read the 4-byte header to get the length,
-/// then read the payload. Strips the NetBIOS framing.
-/// 
-let internal readNetbiosMessage (stream : NetworkStream) : byte array =
-    let rec readLoop () : byte array =
-        let nbHeader = Array.zeroCreate<byte> 4
-        let rec readNB off remaining =
-            match remaining = 0 with
-            | true -> nbHeader
-            | false ->
-                let r = stream.Read(nbHeader, off, remaining)
-                match r = 0 with
-                | true -> nbHeader
-                | false -> readNB (off + r) (remaining - r)
-        readNB 0 4 |> ignore
-        let nbType = nbHeader.[0]
-        match nbType with
-        | 0x85uy -> readLoop ()
-        | t when t <> 0x00uy ->
-            readLoop ()
-        | _ ->
-            let length = int nbHeader.[1] <<< 16 ||| int nbHeader.[2] <<< 8 ||| int nbHeader.[3]
-            let payload = Array.zeroCreate<byte> length
-            let rec readPayload off remaining =
-                match remaining = 0 with
-                | true -> payload
-                | false ->
-                    let r = stream.Read(payload, off, remaining)
-                    match r = 0 with
-                    | true -> payload
-                    | false -> readPayload (off + r) (remaining - r)
-            readPayload 0 length
-    readLoop ()
+/// Advance a stream-fill cursor. A zero-byte read stops the fill (partial buffer).
+let private advanceCursor (cursor : ReadCursor) (got : int) : ReadCursor =
+    match got with
+    | 0 -> { cursor with remaining = 0 }
+    | n -> { cursor with offset = cursor.offset + n; remaining = cursor.remaining - n }
+
+
+let rec private fillFromStream (stream : NetworkStream) (cursor : ReadCursor) : byte array =
+    match cursor.remaining with
+    | 0 -> cursor.buffer
+    | left ->
+        stream.Read(cursor.buffer, cursor.offset, left)
+        |> advanceCursor cursor
+        |> fillFromStream stream
+
+
+let private readExact (stream : NetworkStream) (count : int) : byte array =
+    fillFromStream stream
+        { buffer = Array.zeroCreate count
+          offset = 0
+          remaining = count }
+
+
+let private sessionMessageLength (header : byte array) : int =
+    int header.[1] <<< 16 ||| int header.[2] <<< 8 ||| int header.[3]
+
+
+let private classifyNetbiosHeader (header : byte array) : NetbiosFrame =
+    match header.[0] with
+    | 0x00uy -> SessionMessage (sessionMessageLength header)
+    | _ -> SkipFrame
+
+
+///
+/// Read a NetBIOS Session Message from the stream: 4-byte header, then payload.
+/// Strips the NetBIOS framing. Keep-alives and any other non-message type are skipped.
+let rec internal readNetbiosMessage (stream : NetworkStream) : byte array =
+    match classifyNetbiosHeader (readExact stream 4) with
+    | SkipFrame -> readNetbiosMessage stream
+    | SessionMessage length -> readExact stream length
 
 
 ///
@@ -316,20 +340,24 @@ let private buildSmbNegotiateBody (preferred : SmbDialect) : byte array =
     let needsContexts = preferred = Smb311
     let dialects = le16 dialectCode
     let dialectsEnd = 36 + dialects.Length
+    
     let pad =
         match needsContexts with
         | true -> pad8 dialectsEnd
         | false -> [||]
     let contextOffsetInBody = dialectsEnd + pad.Length
     let contextOffsetInPacket = 64 + contextOffsetInBody
+    
     let contexts =
         match needsContexts with
         | true -> buildNegotiateContexts ()
         | false -> [||]
+    
     let contextOffsetField =
         match needsContexts with
         | true -> uint32 contextOffsetInPacket
         | false -> 0u
+    
     let contextCountField =
         match needsContexts with
         | true -> 2us
@@ -350,11 +378,6 @@ let private buildSmbNegotiateBody (preferred : SmbDialect) : byte array =
 
 
 ///
-/// Back-compat name used by older call sites.
-let private buildSmb2xNegotiateBody = buildSmbNegotiateBody
-
-
-///
 /// Cipher fallback when encryption is advertised but no context selected a cipher.
 let private cipherFallback (hasEncryption : bool) : uint16 =
     match hasEncryption with
@@ -372,51 +395,83 @@ let private alignContextLength (dataLen : int) : int =
 
 
 ///
+/// SMB2_NEGOTIATE_CONTEXT type: ENCRYPTION_CAPABILITIES ([MS-SMB2] §2.2.3.1.2).
+let private encryptionCapabilitiesContext = 0x0002us
+
+
+///
+/// First listed cipher when the context has a non-zero CipherCount.
+let private firstCipherAt (response : byte array) (dataStart : int) : uint16 option =
+    match int (BitConverter.ToUInt16(response, dataStart)) >= 1 with
+    | true -> Some (BitConverter.ToUInt16(response, dataStart + 2))
+    | false -> None
+
+
+///
 /// Read the first encryption cipher from a type-2 negotiate context, if present.
 let private cipherFromEncryptionContext (response : byte array) (off : int) (dataLen : int) : uint16 option =
     let dataStart = off + 8
     match dataStart + 4 <= response.Length && dataLen >= 4 with
     | false -> None
-    | true ->
-        let count = int (BitConverter.ToUInt16(response, dataStart))
-        match count >= 1 && dataStart + 4 <= response.Length with
-        | true -> Some (BitConverter.ToUInt16(response, dataStart + 2))
-        | false -> None
+    | true -> firstCipherAt response dataStart
+
+
+let private contextDataLen (cursor : ContextCursor) : int =
+    int (BitConverter.ToUInt16(cursor.response, cursor.offset + 2))
+
+
+let private tryEncryptionCipher (cursor : ContextCursor) : uint16 option =
+    match BitConverter.ToUInt16(cursor.response, cursor.offset) with
+    | t when t = encryptionCapabilitiesContext ->
+        cipherFromEncryptionContext cursor.response cursor.offset (contextDataLen cursor)
+    | _ -> None
+
+
+let private stepContext (cursor : ContextCursor) : ContextCursor =
+    { cursor with
+        remaining = cursor.remaining - 1
+        offset = cursor.offset + alignContextLength (contextDataLen cursor) }
+
+
+let rec private walkEncryptionContexts (cursor : ContextCursor) : uint16 option =
+    match cursor.remaining > 0 && cursor.offset + 8 <= cursor.response.Length with
+    | false -> None
+    | true -> cipherHereOrNext cursor
+
+
+and private cipherHereOrNext (cursor : ContextCursor) : uint16 option =
+    match tryEncryptionCipher cursor with
+    | Some cipher -> Some cipher
+    | None -> walkEncryptionContexts (stepContext cursor)
 
 
 ///
 /// Walk negotiate contexts looking for ENCRYPTION_CAPABILITIES (type 2).
 let private findEncryptionCipherInContexts (response : byte array) (contextCount : int) (contextOffsetPkt : int) : uint16 option =
-    let rec loop i off =
-        match i < contextCount && off + 8 <= response.Length with
-        | false -> None
-        | true ->
-            let ctxType = BitConverter.ToUInt16(response, off)
-            let dataLen = int (BitConverter.ToUInt16(response, off + 2))
-            match ctxType with
-            | 0x0002us ->
-                match cipherFromEncryptionContext response off dataLen with
-                | Some c -> Some c
-                | None -> loop (i + 1) (off + alignContextLength dataLen)
-            | _ -> loop (i + 1) (off + alignContextLength dataLen)
-    loop 0 contextOffsetPkt
+    walkEncryptionContexts
+        { response = response
+          remaining = contextCount
+          offset = contextOffsetPkt }
+
+
+let private cipherOrFallback (hasEncryption : bool) (found : uint16 option) : uint16 =
+    match found with
+    | Some cipher -> cipher
+    | None -> cipherFallback hasEncryption
 
 
 ///
-/// Parse CipherId from an SMB 3.1.1 negotiate response body.
+/// CipherId from an SMB 3.1.1 negotiate body (contexts start at packet offset 64).
+let private cipherFrom311Fields (response : byte array) (hasEncryption : bool) : uint16 =
+    let body = Array.sub response 64 (response.Length - 64)
+    findEncryptionCipherInContexts response (int (BitConverter.ToUInt16(body, 6))) (int (BitConverter.ToUInt32(body, 60)))
+    |> cipherOrFallback hasEncryption
+
+
 let private parseCipherFrom311Body (response : byte array) (hasEncryption : bool) : uint16 =
-    try
-        let body = Array.sub response 64 (response.Length - 64)
-        match body.Length < 64 with
-        | true -> cipherFallback hasEncryption
-        | false ->
-            let contextCount = int (BitConverter.ToUInt16(body, 6))
-            let contextOffsetPkt = int (BitConverter.ToUInt32(body, 60))
-            match findEncryptionCipherInContexts response contextCount contextOffsetPkt with
-            | Some found -> found
-            | None -> cipherFallback hasEncryption
-    with _ ->
-        cipherFallback hasEncryption
+    match response.Length < 128 with
+    | true -> cipherFallback hasEncryption
+    | false -> cipherFrom311Fields response hasEncryption
 
 
 ///
@@ -424,7 +479,7 @@ let private parseCipherFrom311Body (response : byte array) (hasEncryption : bool
 /// Falls back to AES-128-CCM when the server advertises GLOBAL_CAP_ENCRYPTION but no context.
 /// 
 let private parseNegotiatedCipherId (response : byte array) (dialect : uint16) (capabilities : uint32) : uint16 =
-    let hasEncryption = (capabilities &&& globalCapEncryption) <> 0u
+    let hasEncryption = capabilities &&& globalCapEncryption <> 0u
     match dialect with
     | d when d = Fauli.Constants.smbDialect311 && response.Length >= 64 + 64 ->
         parseCipherFrom311Body response hasEncryption
@@ -449,6 +504,7 @@ let private buildNegotiateState (client : TcpClient) (stream : NetworkStream) (r
     let serverGuid = Array.sub body 8 16
     let capabilities = BitConverter.ToUInt32(body, 24)
     let securityMode = BitConverter.ToUInt16(body, 2)
+    
     { client = client
       stream = stream
       dialect = dialect
@@ -466,6 +522,7 @@ let private buildNegotiateState (client : TcpClient) (stream : NetworkStream) (r
 let private parseNegotiateResponse (client : TcpClient) (stream : NetworkStream) (requestRaw : byte array) (response : byte array) : Result<SmbNegotiateState, AuthError> =
     let header = Array.sub response 0 64
     let status = parseSmb2Status header
+    
     match status = ntStatusSuccess with
     | false -> ProtocolHandshakeFailed |> Error
     | true -> buildNegotiateState client stream requestRaw response |> Ok
@@ -482,6 +539,7 @@ let private buildSessionSetupRequest (securityBlob : byte array) (sessionId : ui
     let structureSize = le16 0x19us  // 25 per MS-SMB2
     let securityBufferLength = le16 (uint16 securityBlob.Length)
     let securityBufferOffset = le16 0x58us
+    
     concatMany [|
         structureSize
         [| 0x00uy |]                    // Flags
@@ -502,16 +560,19 @@ let private parseSessionSetupResponse (response : byte array) : uint64 * uint32 
     let sessionId = BitConverter.ToUInt64(header, 40)
     let body = Array.sub response 64 (response.Length - 64)
     let status = parseSmb2Status header
+    
     let sessionFlags =
         match body.Length >= 4 with
         | true -> BitConverter.ToUInt16(body, 2)
         | false -> 0us
     let securityBufferOffset = int (BitConverter.ToUInt16(body, 4))
     let securityBufferLength = int (BitConverter.ToUInt16(body, 6))
+    
     let securityBlob =
         match securityBufferLength > 0 && securityBufferOffset + securityBufferLength <= response.Length with
         | true -> Some (Array.sub response securityBufferOffset securityBufferLength)
         | false -> None
+    
     sessionId, status, securityBlob, sessionFlags
 
 
@@ -541,6 +602,7 @@ let private sessionRequiresEncryption (dialect : uint16) (_capabilities : uint32
         || dialect = Fauli.Constants.smbDialect302
         || dialect = Fauli.Constants.smbDialect311
     let cipherNegotiated = smb3 && cipherId <> 0us
+    
     flagSet || cipherNegotiated
 
 
@@ -559,10 +621,12 @@ type private SessionFinalizeParams =
 /// Finalize session state: signing key + optional encryption keys.
 let private finalizeSessionState (state : SmbNegotiateState) (values : SessionFinalizeParams) : Result<SmbSessionState, AuthError> =
     let dialect = toSigningDialect state.dialect
+    
     match deriveSigningKey dialect values.sessionKey values.preauthOpt with
     | Error e -> e |> Error
     | Ok derivedKey ->
         let encryptData = sessionRequiresEncryption state.dialect state.capabilities state.cipherId values.sessionFlags
+        
         match tryBuildEncryption dialect values.sessionKey state.cipherId values.preauthOpt encryptData with
         | Error e -> e |> Error
         | Ok encOpt ->
@@ -581,6 +645,7 @@ let private finalizeSessionState (state : SmbNegotiateState) (values : SessionFi
 /// 
 let private openSmbConnection (host : Host) : Result<TcpClient, AuthError> =
     let (Host hostStr) = host
+    
     try
         let client = new TcpClient()
         client.NoDelay <- true
@@ -597,13 +662,14 @@ let private openSmbConnection (host : Host) : Result<TcpClient, AuthError> =
 /// Perform SMB 2.x dialect negotiation for a preferred dialect.
 /// Direct SMB2 NEGOTIATE on 445; SESSION_SETUP uses MessageId=1.
 /// 
-let private negotiateDialects (client : System.Net.Sockets.TcpClient) (preferred : SmbDialect) : Result<SmbNegotiateState, AuthError> =
+let private negotiateDialects (client : TcpClient) (preferred : SmbDialect) : Result<SmbNegotiateState, AuthError> =
     let preferredCode = smbDialectCode preferred
     let stream = client.GetStream()
     let negotiateBody = buildSmbNegotiateBody preferred
     let smb2Header = buildSmb2Header smb2Negotiate 0UL 0UL 0u 0us
     let smb2Request = concat2 smb2Header negotiateBody
     let smb2Response = sendRaw stream smb2Request
+    
     match parseNegotiateResponse client stream smb2Request smb2Response with
     | Error e -> e |> Error
     | Ok state ->
@@ -625,6 +691,7 @@ let private buildKerberosSessionSetupRequest (authParams : KerberosTicketParams)
     let token = buildSmbKerberosToken authParams
     let sessionRequest = buildSessionSetupRequest token 0UL
     let smb2Header = buildSmb2Header 0x0001us 1UL 0UL 0u 1us
+    
     concat2 smb2Header sessionRequest
 
 
@@ -665,6 +732,7 @@ let private establishmentFromBlob (blobOpt : byte array option) (fullKeyBytes : 
 /// Continue Kerberos session setup after a successful or more-processing status.
 let private finalizeKerberosSession (state : SmbNegotiateState) (sessionId : uint64) (status : uint32) (blobOpt : byte array option) (sessionFlags : uint16) (fullKeyBytes : byte array) (fallbackSessionKey : byte array) (preauthAfterReq : byte array) : Result<SmbSessionState, AuthError> =
     let establishment = establishmentFromBlob blobOpt fullKeyBytes
+    
     match establishment with
     | KerberosRejected _ ->
         ProtocolAuthenticationRejected |> Error
@@ -685,6 +753,7 @@ let private smbKerberosSessionSetup (state : SmbNegotiateState) (authParams : Ke
     let preauthAfterReq = preauthAfterSessionSetupRequest state smb2Request
     let response = sendRaw state.stream smb2Request
     let sessionId, status, blobOpt, sessionFlags = parseSessionSetupResponse response
+    
     match status with
     | s when s = ntStatusSuccess || s = ntStatusMoreProcessing ->
         finalizeKerberosSession state sessionId s blobOpt sessionFlags keyBytes sessionKey preauthAfterReq
@@ -716,16 +785,15 @@ let private smbNtlmType1Flags : uint32 =
 /// Clamp a machine name into a 15-char NetBIOS-style workstation label.
 let private clampWorkstationName (name : string) : string =
     match String.IsNullOrWhiteSpace name with
-    | true -> "DESKTOP-FAULI"
     | false when name.Length <= 15 -> name.ToUpperInvariant()
     | false -> name.Substring(0, 15).ToUpperInvariant()
+    | _ -> "DESKTOP-HRMDRV"
 
 
 ///
 /// Workstation name for NTLM — host-derived, not a hardcoded tool banner.
 let private ntlmWorkstationName () : string =
-    try clampWorkstationName Environment.MachineName
-    with _ -> "DESKTOP-FAULI"
+    clampWorkstationName Environment.MachineName
 
 
 ///
@@ -806,44 +874,45 @@ let private ntlmPreauthOpt (state : SmbNegotiateState) (req1 : byte array) (resp
 
 ///
 /// After Type2 challenge is parsed, complete Type3 SESSION_SETUP and finalize.
-let private completeNtlmSessionAfterChallenge (state : SmbNegotiateState) (user : string) (domain : string) (password : string) (workstation : string) (type1 : byte array) (type2Bytes : byte array) (sessionId1 : uint64) (req1 : byte array) (resp1 : byte array) (challenge : ChallengeMessage) : Result<SmbSessionState, AuthError> =
-    let ntlmV2 = computeNtlmV2Response password user domain challenge
+let private completeNtlmSessionAfterChallenge (setup : NtlmSetup) (type2Bytes : byte array) (challenge : ChallengeMessage) : Result<SmbSessionState, AuthError> =
+    let ntlmV2 = computeNtlmV2Response setup.password setup.user setup.domain challenge
     let type3 =
         buildAuthenticateMessage
-            challenge.negotiateFlags ntlmV2 type1 type2Bytes domain user workstation
+            challenge.negotiateFlags ntlmV2 setup.type1 type2Bytes setup.domain setup.user setup.workstation
     let token3 = wrapNtlmNegTokenResp type3
     let req3 =
         concat2
-            (buildSmb2Header 0x0001us 2UL sessionId1 0u 1us)
+            (buildSmb2Header 0x0001us 2UL setup.sessionId1 0u 1us)
             (buildSessionSetupRequest token3 0UL)
-    let resp3 = sendRaw state.stream req3
+    let resp3 = sendRaw setup.state.stream req3
     let sessionId3, status3, _, sessionFlags = parseSessionSetupResponse resp3
     match status3 = ntStatusSuccess || status3 = ntStatusMoreProcessing with
     | false -> ProtocolAuthenticationRejected |> Error
     | true ->
-        finalizeSessionState state
-            { sessionId = preferSessionId sessionId3 sessionId1
+        finalizeSessionState setup.state
+            { sessionId = preferSessionId sessionId3 setup.sessionId1
               sessionKey = truncateSessionKey ntlmV2.exportedSessionKey
-              preauthOpt = ntlmPreauthOpt state req1 resp1 req3
+              preauthOpt = ntlmPreauthOpt setup.state setup.req1 setup.resp1 req3
               sessionFlags = sessionFlags }
+
+
+let private completeFromDecodedChallenge (setup : NtlmSetup) (type2Bytes : byte array) : Result<SmbSessionState, AuthError> =
+    match decodeChallengeMessage type2Bytes with
+    | Error e -> e |> Error
+    | Ok challenge -> completeNtlmSessionAfterChallenge setup type2Bytes challenge
 
 
 ///
 /// Continue NTLM after Type2 bytes are extracted.
-let private continueNtlmAfterType2 (state : SmbNegotiateState) (user : string) (domain : string) (password : string) (workstation : string) (type1 : byte array) (sessionId1 : uint64) (req1 : byte array) (resp1 : byte array) (type2Bytes : byte array) : Result<SmbSessionState, AuthError> =
+let private continueNtlmAfterType2 (setup : NtlmSetup) (type2Bytes : byte array) : Result<SmbSessionState, AuthError> =
     match type2Bytes.Length < 32 with
     | true -> ProtocolAuthenticationRejected |> Error
-    | false ->
-        match decodeChallengeMessage type2Bytes with
-        | Error e -> e |> Error
-        | Ok challenge ->
-            completeNtlmSessionAfterChallenge state user domain password workstation type1 type2Bytes sessionId1 req1 resp1 challenge
+    | false -> completeFromDecodedChallenge setup type2Bytes
 
 
 ///
 /// Full NetNTLMv2 over SMB2: Type1 SESSION_SETUP → Type2 challenge → Type3 SESSION_SETUP.
 /// MessageIds 1 and 2; caller NextMessageId = 3.
-/// 
 let private smbNtlmSessionSetup (state : SmbNegotiateState) (authParams : NtlmResponseParams) : Result<SmbSessionState, AuthError> =
     let (UserName user) = authParams.userName
     let (DomainName domain) = authParams.domain
@@ -858,7 +927,16 @@ let private smbNtlmSessionSetup (state : SmbNegotiateState) (authParams : NtlmRe
     | false, _ | true, None -> ProtocolAuthenticationRejected |> Error
     | true, Some blob1 ->
         extractNtlmType2FromBlob blob1
-        |> continueNtlmAfterType2 state user domain password workstation type1 sessionId1 req1 resp1
+        |> continueNtlmAfterType2
+            { state = state
+              user = user
+              domain = domain
+              password = password
+              workstation = workstation
+              type1 = type1
+              sessionId1 = sessionId1
+              req1 = req1
+              resp1 = resp1 }
 
 
 ///
@@ -972,7 +1050,7 @@ let private continueAfterOpen (preferred : SmbDialect) (authParams : ProtocolHan
 /// Negotiates that dialect only, then performs session setup.
 /// Returns AuthSmb (SmbSession). No tree connect — Fauli hands off here.
 /// When the server requires encryption (RejectUnencryptedAccess / SessionFlags.ENCRYPT_DATA),
-/// SmbSession.Encryption is populated and callers must use sendSmb2 for further traffic.
+/// SmbSession.Encryption is populated on the returned session.
 /// 
 let internal handleSmbWithDialect (host : Host) (authParams : ProtocolHandlerParams) (preferred : SmbDialect) : Result<AuthenticatedResponse, AuthError> =
     let prebuilt = prebuiltKerberosSessionSetup authParams
@@ -987,64 +1065,3 @@ let internal handleSmbWithDialect (host : Host) (authParams : ProtocolHandlerPar
 /// 
 let internal handleSmb (host : Host) (authParams : ProtocolHandlerParams) : Result<AuthenticatedResponse, AuthError> =
     handleSmbWithDialect host authParams Smb311
-
-
-///
-/// Sign the inner SMB2 message when signing material is available.
-let private prepareSignedMessage (session : SmbSession) (smb2Message : byte array) : byte array =
-    let dialect = toSigningDialect session.Dialect
-    match session.SigningKey, session.Dialect with
-    | _, d when d = Fauli.Constants.smbDialect202 || d = Fauli.Constants.smbDialect21 ->
-        signMessage dialect session.SessionKey None smb2Message
-    | Some _, _ ->
-        signMessage dialect session.SessionKey session.SigningKey smb2Message
-    | None, _ ->
-        smb2Message
-
-
-///
-/// Optionally wrap a prepared message in SMB3 TRANSFORM_HEADER encryption.
-let private maybeEncryptWirePayload (session : SmbSession) (prepared : byte array) : byte array =
-    match session.Encryption with
-    | Some enc -> encryptSmbMessage enc session.SessionId prepared
-    | None -> prepared
-
-
-///
-/// Decrypt a response when the server replied with a transform packet.
-let private maybeDecryptResponse (session : SmbSession) (raw : byte array) : Result<byte array, AuthError> =
-    match session.Encryption with
-    | Some enc when isTransformPacket raw ->
-        decryptSmbMessage enc raw
-    | _ when isTransformPacket raw ->
-        UnexpectedError "Received encrypted SMB transform without session encryption keys" |> Error
-    | _ ->
-        raw |> Ok
-
-
-///
-/// Map SMB send/recv transport failures onto domain errors.
-let private mapSmbIoException (ex : exn) : AuthError =
-    match ex with
-    | :? SocketException -> ProtocolConnectionFailed
-    | _ -> UnexpectedError $"SMB send/recv failed: {ex.Message}"
-
-
-///
-/// Sign (when keys present) and optionally TRANSFORM-encrypt an SMB2 message,
-/// send it, read one response, and decrypt if the server replied with a transform.
-/// Use this for all traffic after SESSION_SETUP when Encryption may be Some.
-/// 
-let internal sendSmb2 (session : SmbSession) (smb2Message : byte array) : Result<byte array, AuthError> =
-    try
-        let wirePayload =
-            smb2Message
-            |> prepareSignedMessage session
-            |> maybeEncryptWirePayload session
-        let wrapped = wrapNetbiosMessage wirePayload
-        session.Stream.Write(wrapped, 0, wrapped.Length)
-        session.Stream.Flush()
-        readNetbiosMessage session.Stream
-        |> maybeDecryptResponse session
-    with ex ->
-        mapSmbIoException ex |> Error
