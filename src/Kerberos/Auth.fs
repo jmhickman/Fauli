@@ -21,6 +21,32 @@ let private krbPreauthRequired = 0x19
 let private paEncTimestamp = 2
 
 
+let private mapCryptoError (err : CryptoError) : AuthError =
+    match err with
+    | UnsupportedEncryptionType e -> UnexpectedError $"Encryption type {e} is not supported"
+    | PrfNotImplemented e -> UnexpectedError $"PRF not implemented for {e}"
+    | CiphertextTooShort | MacVerificationFailed -> KerberosTGTAcquisitionFailed
+
+
+let private derivedKey (enctype : EncryptionType) (password : string) (salt : string) : Result<Key, AuthError> =
+    match stringToKey enctype password salt with
+    | Ok key -> key |> Ok
+    | Error e -> mapCryptoError e |> Error
+
+
+let private decryptBytesOr (fail : AuthError) (key : Key) (usage : int) (ciphertext : byte array) : Result<byte array, AuthError> =
+    match decrypt key usage ciphertext with
+    | Ok plain -> plain |> Ok
+    | Error (UnsupportedEncryptionType e) -> UnexpectedError $"Encryption type {e} is not supported" |> Error
+    | Error _ -> fail |> Error
+
+
+let private encryptBytes (key : Key) (usage : int) (plaintext : byte array) : byte array =
+    match encrypt key usage plaintext None with
+    | Ok bytes -> bytes
+    | Error _ -> [||]
+
+
 ///
 /// PA-ETYPE-INFO padata type (11) — etype/salt pairs from KDC.
 let private paEtypeInfo = 11
@@ -238,7 +264,7 @@ let internal buildAsReqWithPreAuth (username : string) (realm : string) (key : K
     let paPac = encodePaData Fauli.Constants.Kerberos.PaPacRequest pacRequest
     let usec = int ((now.Ticks % 10000000L) / 10L)
     let timestampBytes = encodePaEncTsEnc now (usec |> Some)
-    let encryptedTimestamp = encrypt key KeyUsage.AsReqPaEncTs timestampBytes None
+    let encryptedTimestamp = encryptBytes key KeyUsage.AsReqPaEncTs timestampBytes
     let encData = encodeEncryptedData (int key.enctype) None encryptedTimestamp
     let paEncTs = encodePaData paEncTimestamp encData
     let kdcOptions = encodeKdcOptions ["forwardable"; "renewable"; "proxiable"]
@@ -272,7 +298,7 @@ let internal buildPreauthAsReqForProver (username : string) (realm : string) (ke
     let paPac = encodePaData Fauli.Constants.Kerberos.PaPacRequest pacRequest
     let usec = int ((now.Ticks % 10000000L) / 10L)
     let timestampBytes = encodePaEncTsEnc now (usec |> Some)
-    let encryptedTimestamp = encrypt key KeyUsage.AsReqPaEncTs timestampBytes None
+    let encryptedTimestamp = encryptBytes key KeyUsage.AsReqPaEncTs timestampBytes
     let encData = encodeEncryptedData (int key.enctype) None encryptedTimestamp
     let paEncTs = encodePaData paEncTimestamp encData
     let kdcOptions = encodeKdcOptions ["forwardable"; "renewable"; "proxiable"]
@@ -372,14 +398,16 @@ let private checkInitialAsRep (response : byte array) : Result<(int * string opt
 ///
 /// Derive the pre-auth key from etype and password, then build and send the pre-auth AS-REQ.
 let private sendPreAuthAsReq (kdcHost : string) (username : string) (realm : string) (etype : EncryptionType) (saltStr : string) (password : string) (response : byte array) : Result<byte array, AuthError> =
-    let key = stringToKey etype password saltStr
-    let preAuthNow =
-        match extractStimeFromKrbError response with
-        | Some st -> st.AddSeconds(1.0) |> Some  // server time +1s
-        | None -> DateTime.UtcNow |> Some
-    let preAuthNow = preAuthNow.Value
-    let preAuthReq = buildAsReqWithPreAuth username realm key preAuthNow
-    sendKdcRequest kdcHost 88 preAuthReq |> Ok
+    match derivedKey etype password saltStr with
+    | Error e -> e |> Error
+    | Ok key ->
+        let preAuthNow =
+            match extractStimeFromKrbError response with
+            | Some st -> st.AddSeconds 1.0
+            | None -> DateTime.UtcNow
+        buildAsReqWithPreAuth username realm key preAuthNow
+        |> sendKdcRequest kdcHost 88
+        |> Ok
 
 
 ///
@@ -440,20 +468,25 @@ let private extractTgtSessionKey (rep : BerValue) (etype : EncryptionType) (key 
     match extractEncPartCipher rep, extractEncPartEtype rep with
     | None, _ | _, None -> KerberosTGTAcquisitionFailed |> Error
     | Some encCipher, Some encEtype ->
-        let decryptKey =
+        let decryptKeyResult =
             match encEtype = int etype with
-            | true -> key
-            | false -> stringToKey (enum<EncryptionType> encEtype) password saltStr
-        let encAsRepPart = parseBer (decrypt decryptKey KeyUsage.AsRepEncPart encCipher)
-        match extractSessionKeyBytes encAsRepPart encEtype, extractTicketBytes rep with
-        | None, _ | _, None -> KerberosTGTAcquisitionFailed |> Error
-        | Some sessionKey, Some ticketBytes ->
-            { ticketBytes = ticketBytes
-              sessionKey = sessionKey
-              sessionKeyType = int sessionKey.enctype
-              cname = extractCname rep
-              crealm = extractCrealm rep
-              serverTime = None } |> Ok
+            | true -> key |> Ok
+            | false -> derivedKey (enum<EncryptionType> encEtype) password saltStr
+        match decryptKeyResult with
+        | Error e -> e |> Error
+        | Ok decryptKey ->
+            match decryptBytesOr KerberosTGTAcquisitionFailed decryptKey KeyUsage.AsRepEncPart encCipher with
+            | Error e -> e |> Error
+            | Ok plain ->
+                match extractSessionKeyBytes (parseBer plain) encEtype, extractTicketBytes rep with
+                | None, _ | _, None -> KerberosTGTAcquisitionFailed |> Error
+                | Some sessionKey, Some ticketBytes ->
+                    { ticketBytes = ticketBytes
+                      sessionKey = sessionKey
+                      sessionKeyType = int sessionKey.enctype
+                      cname = extractCname rep
+                      crealm = extractCrealm rep
+                      serverTime = None } |> Ok
 
 
 ///
@@ -476,8 +509,9 @@ let private buildAndSendPreAuthAsReq (kdcHost : string) (username : string) (rea
 let private extractTgtSessionKeyFromRep (response : byte array) (password : string) (realm : string) (username : string) (rep : BerValue) : Result<TgtResult, AuthError> =
     let etype, salt = extractSupportedEtypes response |> pickPreferredEtype 
     let saltStr = deriveSaltStr salt realm username
-    let key = stringToKey etype password saltStr
-    extractTgtSessionKey rep etype key saltStr password
+    match derivedKey etype password saltStr with
+    | Error e -> e |> Error
+    | Ok key -> extractTgtSessionKey rep etype key saltStr password
 
 
 ///
@@ -515,8 +549,9 @@ let private extractTgtSessionKeyFromRepWithEtype (response : byte array) (reques
     let supportedEtypes = extractSupportedEtypes response
     let salt = saltForRequestedEtype requestedEtype supportedEtypes
     let saltStr = deriveSaltStr salt realm username
-    let key = stringToKey requestedEtype password saltStr
-    extractTgtSessionKey rep requestedEtype key saltStr password
+    match derivedKey requestedEtype password saltStr with
+    | Error e -> e |> Error
+    | Ok key -> extractTgtSessionKey rep requestedEtype key saltStr password
 
 
 ///
@@ -704,7 +739,7 @@ let internal buildTgsReq (tgtTicket : byte array) (sessionKey : Key) (spn : stri
               ctime = now
               seqNumber = None } 
     let paTgs = 
-        encrypt sessionKey KeyUsage.TgsReqAuth authenticator None
+        encryptBytes sessionKey KeyUsage.TgsReqAuth authenticator
         |> encodeEncryptedData (int sessionKey.enctype) None 
         |> encodeApReq [] tgtTicket 
         |> encodePaData 1 
@@ -797,7 +832,9 @@ let private decryptTgsEncPart (tgt : TgtResult) (rep : BerValue) : Result<BerVal
     match extractEncPartCipher rep with
     | None -> KerberosServiceTicketFailed |> Error
     | Some cipher ->
-        parseBer (decrypt tgt.sessionKey KeyUsage.TgsRepEncPartSesskey cipher) |> Ok
+        match decryptBytesOr KerberosServiceTicketFailed tgt.sessionKey KeyUsage.TgsRepEncPartSesskey cipher with
+        | Error e -> e |> Error
+        | Ok plain -> parseBer plain |> Ok
 
 
 ///
@@ -1070,7 +1107,7 @@ let private buildSmbAuthenticatorMutual (crealm : string) (cname : BerValue) (no
 let internal buildApReq (ticketBytes : byte array) (sessionKey : Key) (crealm : string) (cname : BerValue) : byte array =
     let now = DateTime.UtcNow
     let authenticator = buildSmbAuthenticator crealm cname now
-    let encryptedAuthenticator = encrypt sessionKey KeyUsage.ApReqAuth authenticator None
+    let encryptedAuthenticator = encryptBytes sessionKey KeyUsage.ApReqAuth authenticator
     encodeApReq [] ticketBytes (encodeEncryptedData (int sessionKey.enctype) None encryptedAuthenticator)
 
 
@@ -1081,7 +1118,7 @@ let internal buildApReq (ticketBytes : byte array) (sessionKey : Key) (crealm : 
 let internal buildApReqMutual (ticketBytes : byte array) (sessionKey : Key) (crealm : string) (cname : BerValue) : byte array =
     let now = DateTime.UtcNow
     let authenticator = buildSmbAuthenticatorMutual crealm cname now
-    let encryptedAuthenticator = encrypt sessionKey KeyUsage.ApReqAuth authenticator None
+    let encryptedAuthenticator = encryptBytes sessionKey KeyUsage.ApReqAuth authenticator
     encodeApReq [ "mutual-required" ] ticketBytes (encodeEncryptedData (int sessionKey.enctype) None encryptedAuthenticator)
 
 

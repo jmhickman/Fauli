@@ -38,6 +38,13 @@ type public Key =
       contents : byte array }
 
 
+type CryptoError =
+    | UnsupportedEncryptionType of EncryptionType
+    | CiphertextTooShort
+    | MacVerificationFailed
+    | PrfNotImplemented of EncryptionType
+
+
 let private concat2 (a : byte array) (b : byte array) : byte array =
     let result = Array.zeroCreate<byte> (a.Length + b.Length)
     Array.Copy(a, 0, result, 0, a.Length)
@@ -54,6 +61,7 @@ let private concatMany (arrays : byte array array) : byte array =
             Array.Copy(arrays.[idx], 0, result, offset, arrays.[idx].Length)
             copyLoop (idx + 1) (offset + arrays.[idx].Length)
     copyLoop 0 0
+    
     result
 
 
@@ -86,99 +94,120 @@ let private zeroPadToBlock (data : byte array) : byte array =
         result
 
 
-let internal aesCtsEncrypt (key : byte array) (plaintext : byte array) : byte array =
-    let block = Aes.BlockSize
+let private transformAes (key : byte array) (mode : CipherMode) (encrypt : bool) (data : byte array) : byte array =
     use aes = Aes.Create()
     aes.Key <- key
-    aes.Mode <- CipherMode.CBC
+    aes.Mode <- mode
     aes.Padding <- PaddingMode.None
     aes.IV <- Array.zeroCreate Aes.BlockSize
-    let padded = zeroPadToBlock plaintext
-    use ic = aes.CreateEncryptor()
-    let ctext = ic.TransformFinalBlock(padded, 0, padded.Length)
-    match plaintext.Length <= block with
-    | true -> Array.sub ctext 0 plaintext.Length
-    | false ->
-        let lastlen =
-            let m = plaintext.Length % block
-            match m = 0 with
-            | true -> block
-            | false -> m
-        let prefixLen = ctext.Length - 32
-        let prefix =
-            match prefixLen > 0 with
-            | true -> Array.sub ctext 0 prefixLen
-            | false -> [||]
-        let last16 = Array.sub ctext (ctext.Length - 16) 16
-        let prev16 = Array.sub ctext (ctext.Length - 32) 16
-        let stolen = Array.sub prev16 0 lastlen
-        concatMany [| prefix; last16; stolen |]
+    use transform =
+        match encrypt with
+        | true -> aes.CreateEncryptor()
+        | false -> aes.CreateDecryptor()
+    transform.TransformFinalBlock(data, 0, data.Length)
+
+
+let private cbcEncryptZerosIv (key : byte array) (data : byte array) : byte array =
+    transformAes key CipherMode.CBC true data
+
+
+let private cbcDecryptZerosIv (key : byte array) (data : byte array) : byte array =
+    transformAes key CipherMode.CBC false data
+
+
+let private ecbDecrypt (key : byte array) (data : byte array) : byte array =
+    transformAes key CipherMode.ECB false data
+
+
+///
+/// Residual last-block length for ciphertext stealing (a full block when evenly divisible).
+let private stolenByteCount (messageLength : int) : int =
+    match messageLength % Aes.BlockSize with
+    | 0 -> Aes.BlockSize
+    | rem -> rem
+
+
+///
+/// CBC-CS3 steal: swap the last two ciphertext blocks and truncate Cn-1 ([RFC 3962]).
+let private stealLastCiphertextBlocks (cbcCipher : byte array) (plainLength : int) : byte array =
+    let lastTwoStart = cbcCipher.Length - 2 * Aes.BlockSize
+    let prefix =
+        match lastTwoStart > 0 with
+        | true -> Array.sub cbcCipher 0 lastTwoStart
+        | false -> [||]
+    
+    let cnMinus1 = Array.sub cbcCipher lastTwoStart Aes.BlockSize
+    let cn = Array.sub cbcCipher (lastTwoStart + Aes.BlockSize) Aes.BlockSize
+    
+    Array.concat
+        [ prefix
+          cn
+          Array.sub cnMinus1 0 (stolenByteCount plainLength) ]
+
+
+let internal aesCtsEncrypt (key : byte array) (plaintext : byte array) : byte array =
+    let cbcCipher = cbcEncryptZerosIv key (zeroPadToBlock plaintext)
+    match plaintext.Length <= Aes.BlockSize with
+    | true -> Array.sub cbcCipher 0 plaintext.Length
+    | false -> stealLastCiphertextBlocks cbcCipher plaintext.Length
+
+
+let private padPartialBlock (data : byte array) (offset : int) : byte array =
+    let available = min Aes.BlockSize (data.Length - offset)
+    let block = Array.zeroCreate Aes.BlockSize
+    Array.Copy(data, offset, block, 0, available)
+    
+    block
+
+
+let private ciphertextBlocks (ciphertext : byte array) : byte array array =
+    let count = (ciphertext.Length + Aes.BlockSize - 1) / Aes.BlockSize
+    Array.init count (fun i -> padPartialBlock ciphertext (i * Aes.BlockSize))
+
+
+///
+/// CBC-decrypt every full block except the stolen pair; return plaintext and the next CBC chain value.
+let private decryptCtsPrefix (key : byte array) (blocks : byte array array) : byte array * byte array =
+    let prefixCount = blocks.Length - 2
+    match prefixCount > 0 with
+    | false -> [||], Array.zeroCreate Aes.BlockSize
+    | true ->
+        let prefixCipher =
+            blocks
+            |> Array.take prefixCount
+            |> Array.concat
+        cbcDecryptZerosIv key prefixCipher, blocks.[prefixCount - 1]
+
+
+///
+/// Undo CS3 stealing on the last two ciphertext blocks.
+let private recoverStolenPlaintext (key : byte array) (cn : byte array) (stolen : byte array) (cbcChain : byte array) (stolenLen : int) : byte array * byte array =
+    let dn = ecbDecrypt key cn
+    let pn = xorBytes (Array.sub dn 0 stolenLen) (Array.sub stolen 0 stolenLen)
+    let restoredCnMinus1 =
+        Array.concat
+            [ Array.sub stolen 0 stolenLen
+              Array.sub dn stolenLen (Aes.BlockSize - stolenLen) ]
+    xorBytes (ecbDecrypt key restoredCnMinus1) cbcChain, pn
 
 
 let internal aesCtsDecrypt (key : byte array) (ciphertext : byte array) : byte array =
-    let block = Aes.BlockSize
-    use aes = Aes.Create()
-    aes.Key <- key
-    aes.Mode <- CipherMode.ECB
-    aes.Padding <- PaddingMode.None
-    aes.IV <- Array.zeroCreate Aes.BlockSize
-    match ciphertext.Length <= block with
-    | true ->
-        use dc = aes.CreateDecryptor()
-        dc.TransformFinalBlock(ciphertext, 0, ciphertext.Length)
+    match ciphertext.Length <= Aes.BlockSize with
+    | true -> ecbDecrypt key ciphertext
     | false ->
-        let cblocks =
-            let n = (ciphertext.Length + 15) / 16
-            [| for i = 0 to n - 1 do
-                let s = i * 16
-                let l = min 16 (ciphertext.Length - s)
-                let b = Array.zeroCreate 16
-                Array.Copy(ciphertext, s, b, 0, l)
-                yield b |]
-        let lastlen =
-            let m = ciphertext.Length % 16
-            match m = 0 with
-            | true -> 16
-            | false -> m
-        let numFullBlocksBeforeLast2 = cblocks.Length - 2
-        let rec decryptFullBlocks idx prev res =
-            match idx < numFullBlocksBeforeLast2 with
-            | false -> prev, res
-            | true ->
-                use dc = aes.CreateDecryptor()
-                let d = dc.TransformFinalBlock(cblocks.[idx], 0, 16)
-                let xored = xorBytes d prev
-                let res' = Array.copy res
-                Array.Copy(xored, 0, res', idx * 16, 16)
-                decryptFullBlocks (idx + 1) cblocks.[idx] res'
-        let prevAfterFull, resAfterFull = decryptFullBlocks 0 (Array.zeroCreate<byte> 16) (Array.zeroCreate<byte> ciphertext.Length)
-        use dc2 = aes.CreateDecryptor()
-        let b = dc2.TransformFinalBlock(cblocks.[cblocks.Length - 2], 0, 16)
-        let lastp = Array.zeroCreate lastlen
-        let rec xorLastP j =
-            match j < lastlen with
-            | false -> ()
-            | true ->
-                lastp.[j] <- byte (int b.[j] ^^^ int cblocks.[cblocks.Length - 1].[j])
-                xorLastP (j + 1)
-        xorLastP 0
-        let om = Array.zeroCreate (16 - lastlen)
-        let rec copyOm j =
-            match j < 16 - lastlen with
-            | false -> ()
-            | true ->
-                om.[j] <- b.[lastlen + j]
-                copyOm (j + 1)
-        copyOm 0
-        let fc = Array.zeroCreate 16
-        Array.Copy(cblocks.[cblocks.Length - 1], 0, fc, 0, lastlen)
-        Array.Copy(om, 0, fc, lastlen, 16 - lastlen)
-        use dc3 = aes.CreateDecryptor()
-        let sec = dc3.TransformFinalBlock(fc, 0, 16)
-        let xoredSec = xorBytes sec prevAfterFull
-        Array.Copy(xoredSec, 0, resAfterFull, (cblocks.Length - 2) * 16, 16)
-        Array.Copy(lastp, 0, resAfterFull, (cblocks.Length - 1) * 16, lastlen)
-        resAfterFull
+        let blocks = ciphertextBlocks ciphertext
+        let prefixPlain, cbcChain = decryptCtsPrefix key blocks
+        let pnMinus1, pn =
+            recoverStolenPlaintext
+                key
+                blocks.[blocks.Length - 2]
+                blocks.[blocks.Length - 1]
+                cbcChain
+                (stolenByteCount ciphertext.Length)
+        Array.concat
+            [ prefixPlain
+              pnMinus1
+              pn ]
 
 
 let private aesStringToKey (keySize : int) (password : string) (salt : string) : byte array =
@@ -188,77 +217,72 @@ let private aesStringToKey (keySize : int) (password : string) (salt : string) :
     pbkdf2.GetBytes keySize
 
 
+let rec private gcd a b =
+    match b with
+    | 0 -> a
+    | _ -> gcd b (a % b)
+
+
+///
+/// Rotate a big-endian bit string right by nbits.
+let private rotateBytesRight (arr : byte array) (nbits : int) : byte array =
+    let bitLength = arr.Length * 8
+    let shift = nbits % bitLength
+    match shift with
+    | 0 -> Array.copy arr
+    | _ ->
+        let asLittleEndian = Numerics.BigInteger(Array.rev arr)
+        let mask = (Numerics.BigInteger.One <<< bitLength) - Numerics.BigInteger.One
+        let rotated = asLittleEndian >>> shift ||| (asLittleEndian <<< bitLength - shift &&& mask)
+        let rotatedBytes = rotated.ToByteArray() |> Array.rev
+        let output = Array.zeroCreate arr.Length
+        let srcLen = min rotatedBytes.Length arr.Length
+        Array.Copy(rotatedBytes, rotatedBytes.Length - srcLen, output, arr.Length - srcLen, srcLen)
+        output
+
+
+///
+/// One's-complement (end-around carry) addition of two equal-length big-endian integers.
+let private addOnesComplement (acc : byte array) (slice : byte array) : byte array =
+    let rec addFromRight i carry =
+        match i < 0 with
+        | true -> carry
+        | false ->
+            let sum = int acc.[i] + int slice.[i] + carry
+            acc.[i] <- byte (sum &&& 0xFF)
+            addFromRight (i - 1) (sum >>> 8)
+    let rec endAround i carry =
+        match carry = 0 || i < 0 with
+        | true -> ()
+        | false ->
+            let sum = int acc.[i] + carry
+            acc.[i] <- byte (sum &&& 0xFF)
+            endAround (i - 1) (sum >>> 8)
+    endAround (acc.Length - 1) (addFromRight (acc.Length - 1) 0)
+    acc
+
+
+///
+/// n-fold: fold an arbitrary bit string down to n bytes ([RFC 3961] §5.1).
+let private nfold (input : byte array) (nbytes : int) : byte array =
+    let stretchedLength = nbytes * input.Length / gcd nbytes input.Length
+    let stretched =
+        Array.init (stretchedLength / input.Length) (fun i -> rotateBytesRight input (13 * i))
+        |> Array.concat
+    Array.init (stretchedLength / nbytes) (fun i -> Array.sub stretched (i * nbytes) nbytes)
+    |> Array.fold addOnesComplement (Array.zeroCreate nbytes)
+
+
+///
+/// DK(key, constant) = DR(key, n-fold(constant)) truncated to the key length ([RFC 3961] §5.1).
 let internal aesDerive (key : byte array) (constant : byte array) : byte array =
-    let blockSize = Aes.BlockSize  // AES block size is always 16
-    let nfold (str : byte array) (nbytes : int) : byte array =
-        let slen = str.Length
-        let rec gcd a b = if b = 0 then a else gcd b (a % b)
-        let lcm =  nbytes * slen / gcd nbytes slen
-        let rotateRight (arr : byte array) (nbits : int) : byte array =
-            let len = arr.Length
-            let totalBits = len * 8
-            let shift = nbits % totalBits
-            match shift = 0 with
-            | true -> Array.copy arr
-            | false ->
-                let num = Numerics.BigInteger(arr |> Array.rev)  // BigInteger is little-endian
-                let body = num >>> shift
-                let mask = (Numerics.BigInteger.One <<< totalBits) - Numerics.BigInteger.One
-                let remains = num <<< totalBits - shift &&& mask
-                let res = body ||| remains
-                let resBytes = res.ToByteArray() |> Array.rev  // back to big-endian
-                let output = Array.zeroCreate<byte> len
-                let srcLen = min resBytes.Length len
-                Array.Copy(resBytes, resBytes.Length - srcLen, output, len - srcLen, srcLen)
-                output
-        let bigstr = ResizeArray<byte>()
-        let rec addRotated i =
-            if i < lcm / slen then
-                rotateRight str (13 * i) |> Array.iter bigstr.Add
-                addRotated (i + 1)
-        addRotated 0
-        let bigarr : byte array = bigstr.ToArray()
-        let slices = Array.init (lcm / nbytes) (fun i -> Array.sub bigarr (i * nbytes) nbytes)
-        let result = Array.zeroCreate<byte> nbytes
-        let rec addSlice sliceIdx =
-            match sliceIdx < slices.Length with
-            | false -> ()
-            | true ->
-                let slice = slices.[sliceIdx]
-                let mutable carry = 0
-                for i in (nbytes - 1) .. -1 .. 0 do
-                    let sum = int result.[i] + int slice.[i] + carry
-                    carry <- sum >>> 8
-                    result.[i] <- byte (sum &&& Rc4.Mask)
-                match carry <> 0 with
-                | true ->
-                    let mutable i = nbytes - 1
-                    let mutable c = carry
-                    while c <> 0 do
-                        let s = int result.[i] + c
-                        c <- s >>> 8
-                        result.[i] <- byte (s &&& Rc4.Mask)
-                        i <- i - 1
-                | false -> ()
-                addSlice (sliceIdx + 1)
-        addSlice 0
-        result
-    let plaintext = nfold constant blockSize
-    let rec loop (currentPlaintext : byte array) (seed : byte array) : byte array =
+    let rec expand (seed : byte array) (plaintext : byte array) : byte array =
         match seed.Length >= key.Length with
         | true -> Array.sub seed 0 key.Length
         | false ->
-            use aes = Aes.Create()
-            aes.Key <- key
-            aes.Mode <- CipherMode.CBC
-            aes.Padding <- PaddingMode.None
-            aes.IV <- Array.zeroCreate Aes.BlockSize
-            let ic = aes.CreateEncryptor()
-            let ciphertext = ic.TransformFinalBlock(currentPlaintext, 0, currentPlaintext.Length)
-            ic.Dispose()
-            aes.Dispose()
-            loop ciphertext (concat2 seed ciphertext)
-    loop plaintext Array.empty<byte>
+            let next = cbcEncryptZerosIv key plaintext
+            expand (concat2 seed next) next
+    expand Array.empty<byte> (nfold constant Aes.BlockSize)
 
 
 let aesStringToKeyFull (keySize : int) (password : string) (salt : string) : byte array =
@@ -288,12 +312,7 @@ let private aesEncrypt (key : byte array) (keyUsage : int) (plaintext : byte arr
     concat2 encrypted mac
 
 
-let private aesDecrypt (key : byte array) (keyUsage : int) (ciphertext : byte array) (keySize : int) : byte array =
-    let blockSize = Aes.BlockSize
-    let macSize = Aes.MacSize
-    match ciphertext.Length < blockSize + macSize with
-    | true -> invalidArg "ciphertext" "Ciphertext too short for AES decryption"
-    | false -> ()
+let private finishAesDecrypt (key : byte array) (keyUsage : int) (ciphertext : byte array) (blockSize : int) (macSize : int) : Result<byte array, CryptoError> =
     let ki = aesDerive key (buildUsageConstant keyUsage Aes.UsageMarkerEncrypt)
     let ke = aesDerive key (buildUsageConstant keyUsage Aes.UsageMarkerDecrypt)
     let basicCiphertext = Array.sub ciphertext 0 (ciphertext.Length - macSize)
@@ -304,9 +323,16 @@ let private aesDecrypt (key : byte array) (keyUsage : int) (ciphertext : byte ar
         |> Array.truncate macSize
     let receivedMac = Array.sub ciphertext (ciphertext.Length - macSize) macSize
     match constantTimeCompare receivedMac expectedMac with
-    | false -> invalidArg "ciphertext" "MAC verification failed"
-    | true -> ()
-    Array.sub basicPlaintext blockSize (basicPlaintext.Length - blockSize)
+    | false -> MacVerificationFailed |> Error
+    | true -> Array.sub basicPlaintext blockSize (basicPlaintext.Length - blockSize) |> Ok
+
+
+let private aesDecrypt (key : byte array) (keyUsage : int) (ciphertext : byte array) (keySize : int) : Result<byte array, CryptoError> =
+    let blockSize = Aes.BlockSize
+    let macSize = Aes.MacSize
+    match ciphertext.Length < blockSize + macSize with
+    | true -> CiphertextTooShort |> Error
+    | false -> finishAesDecrypt key keyUsage ciphertext blockSize macSize
 
 
 ///
@@ -320,45 +346,40 @@ let private rc4MapUsage (keyUsage : int) : int =
     | _ -> keyUsage
 
 
+let private swapBytes (arr : byte array) (a : int) (b : int) : unit =
+    let tmp = arr.[a]
+    arr.[a] <- arr.[b]
+    arr.[b] <- tmp
+
+
+///
+/// RC4 key-scheduling algorithm: identity permutation scrambled by the key.
 let private rc4Ksa (keyBytes : byte array) : byte array =
-    let S = Array.zeroCreate<byte> Rc4.StateSize
-    let keyLen = keyBytes.Length
-    let rec init i =
+    let state = Array.init Rc4.StateSize byte
+    let rec scramble i j =
         match i < Rc4.StateSize with
-        | false -> ()
+        | false -> state
         | true ->
-            S.[i] <- byte i
-            init (i + 1)
-    init 0
-    let rec permute i j =
-        match i < Rc4.StateSize with
-        | false -> ()
-        | true ->
-            let j' = j + int keyBytes.[i % keyLen] + int S.[i] &&& Rc4.Mask
-            let tmp = S.[i]
-            S.[i] <- S.[j']
-            S.[j'] <- tmp
-            permute (i + 1) j'
-    permute 0 0
-    S
+            let j' = j + int keyBytes.[i % keyBytes.Length] + int state.[i] &&& Rc4.Mask
+            swapBytes state i j'
+            scramble (i + 1) j'
+    scramble 0 0
 
 
-let private rc4Prga (S : byte array) (input : byte array) : byte array =
-    let output = Array.zeroCreate<byte> input.Length
-    let rec generate idx i' j' =
-        match idx < input.Length with
-        | false -> ()
-        | true ->
-            let i'' = i' + 1 &&& Rc4.Mask
-            let j'' = j' + int S.[i''] &&& Rc4.Mask
-            let tmp = S.[i'']
-            S.[i''] <- S.[j'']
-            S.[j''] <- tmp
-            let xorIndex = int S.[i''] + int S.[j''] &&& Rc4.Mask
-            output.[idx] <- byte (int input.[idx] ^^^ int S.[xorIndex])
-            generate (idx + 1) i'' j''
-    generate 0 0 0
-    output
+///
+/// RC4 pseudo-random generation: keystream XOR of the input.
+let private rc4Prga (state : byte array) (input : byte array) : byte array =
+    let rec emit (idx : int) (i : int) (j : int) (output : byte array) : byte array =
+        match idx >= input.Length with
+        | true -> output
+        | false ->
+            let i' = i + 1 &&& Rc4.Mask
+            let j' = j + int state.[i'] &&& Rc4.Mask
+            swapBytes state i' j'
+            let k = int state.[i'] + int state.[j'] &&& Rc4.Mask
+            output.[idx] <- input.[idx] ^^^ state.[k]
+            emit (idx + 1) i' j' output
+    emit 0 0 0 (Array.zeroCreate<byte> input.Length)
 
 
 let private rc4Crypt (keyBytes : byte array) (input : byte array) : byte array =
@@ -369,55 +390,169 @@ let private rc4Crypt (keyBytes : byte array) (input : byte array) : byte array =
 let private rc4HmacMd5Encrypt (key : byte array) (keyUsage : int) (plaintext : byte array) (confounder : byte array option) : byte array =
     let usageBytes = BitConverter.GetBytes(rc4MapUsage keyUsage)  // little-endian per RFC 4757
     let conf = defaultArg confounder (getRandomBytes Rc4.ConfounderSize)
+    
     use kiHmac = new HMACMD5(key)
     let ki = kiHmac.ComputeHash(usageBytes : byte array)
+    
     use cksumHmac = new HMACMD5(ki)
     let data = concat2 conf plaintext
     let cksum = cksumHmac.ComputeHash(data : byte array)
+    
     use keHmac = new HMACMD5(ki)
     let ke = keHmac.ComputeHash(cksum : byte array)
     let encrypted = rc4Crypt ke data
+    
     concat2 cksum encrypted
+
+
+let private stripRc4Confounder (basicPlaintext : byte array) : byte array =
+    Array.sub basicPlaintext Rc4.ConfounderSize (basicPlaintext.Length - Rc4.ConfounderSize)
+
+
+let private rc4MacMatches (key : byte array) (cksum : byte array) (basicPlaintext : byte array) : bool =
+    use verifyHmac = new HMACMD5(key)
+    constantTimeCompare cksum (verifyHmac.ComputeHash basicPlaintext)
+
+
+let private tryRc4Usage9Fallback (key : byte array) (cksum : byte array) (basicPlaintext : byte array) : Result<byte array, CryptoError> =
+    let usage8Bytes = BitConverter.GetBytes 9
+    use kiHmac2 = new HMACMD5(key)
+    let ki2 = kiHmac2.ComputeHash(usage8Bytes : byte array)
+    match rc4MacMatches ki2 cksum basicPlaintext with
+    | true -> stripRc4Confounder basicPlaintext |> Ok
+    | false -> MacVerificationFailed |> Error
 
 
 ///
 /// Try MAC verification with fallback usage 8 (RFC 4757 errata).
-let private tryRc4MacVerification (key : byte array) (keyUsage : int) (cksum : byte array) (basicPlaintext : byte array) : byte array =
-    use verifyHmac = new HMACMD5(key)
-    let expectedCksum = verifyHmac.ComputeHash(basicPlaintext : byte array)
-    match constantTimeCompare cksum expectedCksum with
-    | true ->
-        Array.sub basicPlaintext Rc4.ConfounderSize (basicPlaintext.Length - Rc4.ConfounderSize)
-    | false ->
-        match keyUsage = 9 with
-        | true ->
-            let usage8Bytes = BitConverter.GetBytes(9)
-            use kiHmac2 = new HMACMD5(key)
-            let ki2 = kiHmac2.ComputeHash(usage8Bytes : byte array)
-            use verifyHmac2 = new HMACMD5(ki2)
-            let expectedCksum2 = verifyHmac2.ComputeHash(basicPlaintext : byte array)
-            match constantTimeCompare cksum expectedCksum2 with
-            | true ->
-                Array.sub basicPlaintext Rc4.ConfounderSize (basicPlaintext.Length - Rc4.ConfounderSize)
-            | false ->
-                invalidArg "ciphertext" "MAC verification failed for RC4-HMAC-MD5"
-        | false ->
-            invalidArg "ciphertext" "MAC verification failed for RC4-HMAC-MD5"
+let private tryRc4MacVerification (key : byte array) (keyUsage : int) (cksum : byte array) (basicPlaintext : byte array) : Result<byte array, CryptoError> =
+    match rc4MacMatches key cksum basicPlaintext with
+    | true -> stripRc4Confounder basicPlaintext |> Ok
+    | false when keyUsage = 9 -> tryRc4Usage9Fallback key cksum basicPlaintext
+    | false -> MacVerificationFailed |> Error
 
 
-let private rc4HmacMd5Decrypt (key : byte array) (keyUsage : int) (ciphertext : byte array) : byte array =
-    let usageBytes = BitConverter.GetBytes(rc4MapUsage keyUsage)  // little-endian
+let private rc4HmacMd5Decrypt (key : byte array) (keyUsage : int) (ciphertext : byte array) : Result<byte array, CryptoError> =
+    let usageBytes = BitConverter.GetBytes(rc4MapUsage keyUsage)
     match ciphertext.Length < Rc4.Md5ChecksumSize + Rc4.ConfounderSize with
-    | true -> invalidArg "ciphertext" "Ciphertext too short for RC4-HMAC-MD5 decryption"
-    | false -> ()
-    let cksum = Array.sub ciphertext 0 Rc4.Md5ChecksumSize
-    let basicCtext = Array.sub ciphertext Rc4.Md5ChecksumSize (ciphertext.Length - Rc4.Md5ChecksumSize)
-    use kiHmac = new HMACMD5(key)
-    let ki = kiHmac.ComputeHash(usageBytes : byte array)
-    use keHmac = new HMACMD5(ki)
-    let ke = keHmac.ComputeHash(cksum : byte array)
-    let basicPlaintext = rc4Crypt ke basicCtext
-    tryRc4MacVerification ki keyUsage cksum basicPlaintext
+    | true -> CiphertextTooShort |> Error
+    | false ->
+        let cksum = Array.sub ciphertext 0 Rc4.Md5ChecksumSize
+        let basicCtext = Array.sub ciphertext Rc4.Md5ChecksumSize (ciphertext.Length - Rc4.Md5ChecksumSize)
+        use kiHmac = new HMACMD5(key)
+        let ki = kiHmac.ComputeHash(usageBytes : byte array)
+        use keHmac = new HMACMD5(ki)
+        let ke = keHmac.ComputeHash(cksum : byte array)
+        rc4Crypt ke basicCtext
+        |> tryRc4MacVerification ki keyUsage cksum
+
+
+type private Md4Reg =
+    { a : uint32
+      b : uint32
+      c : uint32
+      d : uint32 }
+
+
+let private leftRotate (x : uint32) (n : int) : uint32 =
+    x <<< n ||| (x >>> 32 - n)
+
+
+let private md4F u v w = u &&& v ||| (~~~u &&& w)
+
+
+let private md4G u v w = u &&& v ||| (u &&& w) ||| (v &&& w)
+
+
+let private md4H u v w = u ^^^ v ^^^ w
+
+
+let private uint32FromLe (arr : byte array) (off : int) : uint32 =
+    uint32 arr.[off] ||| (uint32 arr.[off + 1] <<< 8) ||| (uint32 arr.[off + 2] <<< 16) ||| (uint32 arr.[off + 3] <<< 24)
+
+
+let private uint32ToLe (v : uint32) : byte array =
+    [| byte (v &&& 0xFFu); byte (v >>> 8 &&& 0xFFu); byte (v >>> 16 &&& 0xFFu); byte (v >>> 24 &&& 0xFFu) |]
+
+
+///
+/// Round 1: sequential X, shifts 3/7/11/19.
+let private md4Round1 =
+    [| 0, 3; 1, 7; 2, 11; 3, 19
+       4, 3; 5, 7; 6, 11; 7, 19
+       8, 3; 9, 7; 10, 11; 11, 19
+       12, 3; 13, 7; 14, 11; 15, 19 |]
+
+
+///
+/// Round 2: X stride 4, shifts 3/5/9/13.
+let private md4Round2 =
+    [| 0, 3; 4, 5; 8, 9; 12, 13
+       1, 3; 5, 5; 9, 9; 13, 13
+       2, 3; 6, 5; 10, 9; 14, 13
+       3, 3; 7, 5; 11, 9; 15, 13 |]
+
+
+///
+/// Round 3: X 0/8/4/12 then odds, shifts 3/9/11/15.
+let private md4Round3 =
+    [| 0, 3; 8, 9; 4, 11; 12, 15
+       2, 3; 10, 9; 6, 11; 14, 15
+       1, 3; 9, 9; 5, 11; 13, 15
+       3, 3; 11, 9; 7, 11; 15, 15 |]
+
+
+///
+/// One MD4 operation, then rotate so the next target sits in `a`.
+let private md4Step (f : uint32 -> uint32 -> uint32 -> uint32) (k : uint32) (x : uint32 array) (s : Md4Reg) (xi : int, shift : int) : Md4Reg =
+    let a' = leftRotate (s.a + f s.b s.c s.d + x.[xi] + k) shift
+    { a = s.d
+      b = a'
+      c = s.b
+      d = s.c }
+
+
+let private md4Round (f : uint32 -> uint32 -> uint32 -> uint32) (k : uint32) (schedule : (int * int) array) (x : uint32 array) (state : Md4Reg) : Md4Reg =
+    schedule |> Array.fold (md4Step f k x) state
+
+
+let private md4Pad (input : byte array) : byte array =
+    let bitLen = int64 input.Length * 8L
+    let mod64 = input.Length % Md4.BlockBytes
+    let padLen =
+        match mod64 < 56 with
+        | true -> 56 - mod64
+        | false -> 120 - mod64
+    let padded = Array.zeroCreate<byte> (input.Length + padLen + 8)
+    Array.Copy(input, padded, input.Length)
+    
+    padded.[input.Length] <- 0x80uy
+    let rec writeBitLen i =
+        match i < 8 with
+        | false -> ()
+        | true ->
+            padded.[input.Length + padLen + i] <- byte (int (bitLen >>> (i * 8) &&& 0xFFL))
+            writeBitLen (i + 1)
+    writeBitLen 0
+    
+    padded
+
+
+let private loadBlock (padded : byte array) (blockStart : int) : uint32 array =
+    Array.init 16 (fun i -> uint32FromLe padded (blockStart + i * 4))
+
+
+let private processBlock (h : Md4Reg) (x : uint32 array) : Md4Reg =
+    let after =
+        h
+        |> md4Round md4F 0u md4Round1 x
+        |> md4Round md4G Md4.Round2Constant md4Round2 x
+        |> md4Round md4H Md4.Round3Constant md4Round3 x
+    
+    { a = h.a + after.a
+      b = h.b + after.b
+      c = h.c + after.c
+      d = h.d + after.d }
 
 
 ///
@@ -425,130 +560,49 @@ let private rc4HmacMd5Decrypt (key : byte array) (keyUsage : int) (ciphertext : 
 /// (RFC 4757 §2) and NT-Hash computation in NetNTLMv2.
 /// 
 let internal md4 (input : byte array) : byte array =
-    let leftRotate x n = x <<< n ||| (x >>> (32 - n))
-    let F u v w = u &&& v ||| (~~~u &&& w)
-    let G u v w = u &&& v ||| (u &&& w) ||| (v &&& w)
-    let H u v w = u ^^^ v ^^^ w
-    let leInt (arr : byte array) off =
-        uint32 arr.[off] ||| (uint32 arr.[off + 1] <<< 8) ||| (uint32 arr.[off + 2] <<< 16) ||| (uint32 arr.[off + 3] <<< 24)
-    let beInt v =
-        [| byte (v &&& 0xFFu); byte (v >>> 8 &&& 0xFFu); byte (v >>> 16 &&& 0xFFu); byte (v >>> 24 &&& 0xFFu) |]
-    let bitLen = int64 input.Length * 8L  // input length in bits, for MD4 padding
-    let mod64 = input.Length % Md4.BlockBytes
-    let padLen = if mod64 < 56 then 56 - mod64 else 120 - mod64
-    let padded = Array.zeroCreate<byte> (input.Length + padLen + 8)
-    System.Array.Copy(input, padded, input.Length)
-    padded.[input.Length] <- 0x80uy
-    let rec writeBitLen i =
-        if i < 8 then
-            padded.[input.Length + padLen + i] <- byte (int (bitLen >>> (i * 8) &&& 0xFFL))
-            writeBitLen (i + 1)
-    writeBitLen 0
-    let rec processBlocks blockStart (h1 : uint32) (h2 : uint32) (h3 : uint32) (h4 : uint32) =
+    let padded = md4Pad input
+    let rec processBlocks blockStart (h : Md4Reg) =
         match blockStart > padded.Length - Md4.BlockBytes with
-        | true -> h1, h2, h3, h4
-        | false ->
-            let X = Array.zeroCreate<uint32> 16
-            let rec loadX i =
-                match i < 16 with
-                | false -> ()
-                | true ->
-                    X.[i] <- leInt padded (blockStart + i * 4)
-                    loadX (i + 1)
-            loadX 0
-            let mutable a, b, c, d = h1, h2, h3, h4
-            a <- leftRotate (a + F b c d + X.[ 0]) 3
-            d <- leftRotate (d + F a b c + X.[ 1]) 7
-            c <- leftRotate (c + F d a b + X.[ 2]) 11
-            b <- leftRotate (b + F c d a + X.[ 3]) 19
-            a <- leftRotate (a + F b c d + X.[ 4]) 3
-            d <- leftRotate (d + F a b c + X.[ 5]) 7
-            c <- leftRotate (c + F d a b + X.[ 6]) 11
-            b <- leftRotate (b + F c d a + X.[ 7]) 19
-            a <- leftRotate (a + F b c d + X.[ 8]) 3
-            d <- leftRotate (d + F a b c + X.[ 9]) 7
-            c <- leftRotate (c + F d a b + X.[10]) 11
-            b <- leftRotate (b + F c d a + X.[11]) 19
-            a <- leftRotate (a + F b c d + X.[12]) 3
-            d <- leftRotate (d + F a b c + X.[13]) 7
-            c <- leftRotate (c + F d a b + X.[14]) 11
-            b <- leftRotate (b + F c d a + X.[15]) 19
-            a <- leftRotate (a + G b c d + X.[ 0] + Md4.Round2Constant) 3
-            d <- leftRotate (d + G a b c + X.[ 4] + Md4.Round2Constant) 5
-            c <- leftRotate (c + G d a b + X.[ 8] + Md4.Round2Constant) 9
-            b <- leftRotate (b + G c d a + X.[12] + Md4.Round2Constant) 13
-            a <- leftRotate (a + G b c d + X.[ 1] + Md4.Round2Constant) 3
-            d <- leftRotate (d + G a b c + X.[ 5] + Md4.Round2Constant) 5
-            c <- leftRotate (c + G d a b + X.[ 9] + Md4.Round2Constant) 9
-            b <- leftRotate (b + G c d a + X.[13] + Md4.Round2Constant) 13
-            a <- leftRotate (a + G b c d + X.[ 2] + Md4.Round2Constant) 3
-            d <- leftRotate (d + G a b c + X.[ 6] + Md4.Round2Constant) 5
-            c <- leftRotate (c + G d a b + X.[10] + Md4.Round2Constant) 9
-            b <- leftRotate (b + G c d a + X.[14] + Md4.Round2Constant) 13
-            a <- leftRotate (a + G b c d + X.[ 3] + Md4.Round2Constant) 3
-            d <- leftRotate (d + G a b c + X.[ 7] + Md4.Round2Constant) 5
-            c <- leftRotate (c + G d a b + X.[11] + Md4.Round2Constant) 9
-            b <- leftRotate (b + G c d a + X.[15] + Md4.Round2Constant) 13
-            a <- leftRotate (a + H b c d + X.[ 0] + Md4.Round3Constant) 3
-            d <- leftRotate (d + H a b c + X.[ 8] + Md4.Round3Constant) 9
-            c <- leftRotate (c + H d a b + X.[ 4] + Md4.Round3Constant) 11
-            b <- leftRotate (b + H c d a + X.[12] + Md4.Round3Constant) 15
-            a <- leftRotate (a + H b c d + X.[ 2] + Md4.Round3Constant) 3
-            d <- leftRotate (d + H a b c + X.[10] + Md4.Round3Constant) 9
-            c <- leftRotate (c + H d a b + X.[ 6] + Md4.Round3Constant) 11
-            b <- leftRotate (b + H c d a + X.[14] + Md4.Round3Constant) 15
-            a <- leftRotate (a + H b c d + X.[ 1] + Md4.Round3Constant) 3
-            d <- leftRotate (d + H a b c + X.[ 9] + Md4.Round3Constant) 9
-            c <- leftRotate (c + H d a b + X.[ 5] + Md4.Round3Constant) 11
-            b <- leftRotate (b + H c d a + X.[13] + Md4.Round3Constant) 15
-            a <- leftRotate (a + H b c d + X.[ 3] + Md4.Round3Constant) 3
-            d <- leftRotate (d + H a b c + X.[11] + Md4.Round3Constant) 9
-            c <- leftRotate (c + H d a b + X.[ 7] + Md4.Round3Constant) 11
-            b <- leftRotate (b + H c d a + X.[15] + Md4.Round3Constant) 15
-            let h1' = h1 + a
-            let h2' = h2 + b
-            let h3' = h3 + c
-            let h4' = h4 + d
-            processBlocks (blockStart + Md4.BlockBytes) h1' h2' h3' h4'
-    let h1, h2, h3, h4 =
-        processBlocks 0 0x67452301u 0xEFCDAB89u 0x98BADCFEu 0x10325476u
-    let result = Array.zeroCreate<byte> 16  // MD4 digest size (128 bits)
-    System.Array.Copy(beInt h1, 0, result, 0, 4)
-    System.Array.Copy(beInt h2, 0, result, 4, 4)
-    System.Array.Copy(beInt h3, 0, result, 8, 4)
-    System.Array.Copy(beInt h4, 0, result, 12, 4)
-    result
+        | true -> h
+        | false -> processBlocks (blockStart + Md4.BlockBytes) (processBlock h (loadBlock padded blockStart))
+    let h =
+        processBlocks 0
+            { a = 0x67452301u
+              b = 0xEFCDAB89u
+              c = 0x98BADCFEu
+              d = 0x10325476u }
+    Array.concat
+        [ uint32ToLe h.a
+          uint32ToLe h.b
+          uint32ToLe h.c
+          uint32ToLe h.d ]
 
 
-let stringToKey (enctype : EncryptionType) (password : string) (salt : string) : Key =
+let stringToKey (enctype : EncryptionType) (password : string) (salt : string) : Result<Key, CryptoError> =
     match enctype with
     | EncryptionType.AES256_CTS_HMAC_SHA1_96 ->
-        let keyBytes = aesStringToKeyFull 32 password salt
-        { enctype = EncryptionType.AES256_CTS_HMAC_SHA1_96; contents = keyBytes }
+        { enctype = EncryptionType.AES256_CTS_HMAC_SHA1_96
+          contents = aesStringToKeyFull 32 password salt } |> Ok
     | EncryptionType.AES128_CTS_HMAC_SHA1_96 ->
-        let keyBytes = aesStringToKeyFull 16 password salt
-        { enctype = EncryptionType.AES128_CTS_HMAC_SHA1_96; contents = keyBytes }
+        { enctype = EncryptionType.AES128_CTS_HMAC_SHA1_96
+          contents = aesStringToKeyFull 16 password salt } |> Ok
     | EncryptionType.ARCFOUR_HMAC_MD5 ->
-        { enctype = EncryptionType.ARCFOUR_HMAC_MD5; contents = md4 (Encoding.Unicode.GetBytes password) }
-    | _ ->
-        invalidArg "enctype" $"Encryption type {enctype} is not supported"
+        { enctype = EncryptionType.ARCFOUR_HMAC_MD5
+          contents = md4 (Encoding.Unicode.GetBytes password) } |> Ok
+    | other -> UnsupportedEncryptionType other |> Error
 
 
 ///
 /// Encrypt plaintext using the given key and Kerberos key usage number.
-/// Follows RFC 3961 §5: derives encryption/MAC keys from the base key via
-/// the usage constant, then encrypts and appends the checksum.
-/// 
-let internal encrypt (key : Key) (keyUsage : int) (plaintext : byte array) (confounder : byte array option) : byte array =
+let internal encrypt (key : Key) (keyUsage : int) (plaintext : byte array) (confounder : byte array option) : Result<byte array, CryptoError> =
     match key.enctype with
     | EncryptionType.AES256_CTS_HMAC_SHA1_96 ->
-        aesEncrypt key.contents keyUsage plaintext confounder 32
+        aesEncrypt key.contents keyUsage plaintext confounder 32 |> Ok
     | EncryptionType.AES128_CTS_HMAC_SHA1_96 ->
-        aesEncrypt key.contents keyUsage plaintext confounder 16
+        aesEncrypt key.contents keyUsage plaintext confounder 16 |> Ok
     | EncryptionType.ARCFOUR_HMAC_MD5 ->
-        rc4HmacMd5Encrypt key.contents keyUsage plaintext confounder
-    | _ ->
-        invalidArg "enctype" $"Encryption type {key.enctype} is not supported"
+        rc4HmacMd5Encrypt key.contents keyUsage plaintext confounder |> Ok
+    | other -> UnsupportedEncryptionType other |> Error
 
 
 ///
@@ -556,7 +610,7 @@ let internal encrypt (key : Key) (keyUsage : int) (plaintext : byte array) (conf
 /// Follows RFC 3961 §5: derives encryption/MAC keys, verifies the checksum
 /// in constant time, then decrypts and strips the usage prefix.
 /// 
-let internal decrypt (key : Key) (keyUsage : int) (ciphertext : byte array) : byte array =
+let internal decrypt (key : Key) (keyUsage : int) (ciphertext : byte array) : Result<byte array, CryptoError> =
     match key.enctype with
     | EncryptionType.AES256_CTS_HMAC_SHA1_96 ->
         aesDecrypt key.contents keyUsage ciphertext 32
@@ -564,8 +618,7 @@ let internal decrypt (key : Key) (keyUsage : int) (ciphertext : byte array) : by
         aesDecrypt key.contents keyUsage ciphertext 16
     | EncryptionType.ARCFOUR_HMAC_MD5 ->
         rc4HmacMd5Decrypt key.contents keyUsage ciphertext
-    | _ ->
-        invalidArg "enctype" $"Encryption type {key.enctype} is not supported"
+    | other -> UnsupportedEncryptionType other |> Error
 
 
 ///
@@ -574,13 +627,14 @@ let internal decrypt (key : Key) (keyUsage : int) (ciphertext : byte array) : by
 /// the truncated hash under the derived key. Used for key derivation in
 /// password change and session key negotiation protocols.
 /// 
-let internal prf (key : Key) (input : byte array) : byte array =
+let internal prf (key : Key) (input : byte array) : Result<byte array, CryptoError> =
     let aesPrfEncrypt (kp : byte array) (truncated : byte array) : byte array =
         use aes = Aes.Create()
         aes.Key <- kp
         aes.Mode <- CipherMode.ECB
         aes.Padding <- PaddingMode.None
         aes.IV <- Array.zeroCreate Aes.BlockSize
+        
         use ec = aes.CreateEncryptor()
         ec.TransformFinalBlock(truncated, 0, 16)
     match key.enctype with
@@ -590,23 +644,5 @@ let internal prf (key : Key) (input : byte array) : byte array =
         sha1.ComputeHash input
         |> Array.truncate Aes.BlockSize
         |> aesPrfEncrypt (aesDerive key.contents (Encoding.ASCII.GetBytes "prf"))
-    | _ -> invalidArg "enctype" $"PRF not implemented for {key.enctype}"
-
-
-///
-/// Tolerant decrypt for AP_REP enc-part cipher (skips strict MAC verification for diagnosis / when exact slice is hard to isolate).
-/// For production use the normal decrypt.
-/// 
-let internal decryptApRepCipher (key : Key) (keyUsage : int) (ciphertext : byte array) : byte array =
-    match key.enctype with
-    | EncryptionType.AES256_CTS_HMAC_SHA1_96 ->
-        let macSize = 12
-        let basic = if ciphertext.Length > macSize then Array.sub ciphertext 0 (ciphertext.Length - macSize) else ciphertext
-        let ke = aesDerive key.contents (buildUsageConstant keyUsage Aes.UsageMarkerDecrypt)
-        aesCtsDecrypt ke basic
-    | EncryptionType.AES128_CTS_HMAC_SHA1_96 ->
-        let macSize = 12
-        let basic = if ciphertext.Length > macSize then Array.sub ciphertext 0 (ciphertext.Length - macSize) else ciphertext
-        let ke = aesDerive key.contents (buildUsageConstant keyUsage Aes.UsageMarkerDecrypt)
-        aesCtsDecrypt ke basic
-    | _ -> Array.empty
+        |> Ok
+    | other -> PrfNotImplemented other |> Error

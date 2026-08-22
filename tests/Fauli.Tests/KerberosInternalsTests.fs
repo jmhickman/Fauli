@@ -11,12 +11,18 @@ open Fauli.Kerberos.Auth
 // Helpers
 // ============================================================================
 
+let private cryptoOk result =
+    match result with
+    | Ok v -> v
+    | Error e -> failwith $"expected Ok, got {e}"
+
+
 let private makeTestKey () : Key =
     { enctype = EncryptionType.AES256_CTS_HMAC_SHA1_96
       contents = Array.init 32 (fun i -> byte (i + 42)) }
 
 let private makeTestKeyFromPassword (pw : string) (salt : string) : Key =
-    stringToKey EncryptionType.AES256_CTS_HMAC_SHA1_96 pw salt
+    stringToKey EncryptionType.AES256_CTS_HMAC_SHA1_96 pw salt |> cryptoOk
 
 // ============================================================================
 // 1. Key Derivation (stringToKey)
@@ -30,8 +36,8 @@ let ``stringToKey AES256 produces deterministic 32-byte key`` () =
 
 [<Fact>]
 let ``stringToKey is stable across calls`` () =
-    let k1 = stringToKey EncryptionType.AES256_CTS_HMAC_SHA1_96 "password" "SALT"
-    let k2 = stringToKey EncryptionType.AES256_CTS_HMAC_SHA1_96 "password" "SALT"
+    let k1 = stringToKey EncryptionType.AES256_CTS_HMAC_SHA1_96 "password" "SALT" |> cryptoOk
+    let k2 = stringToKey EncryptionType.AES256_CTS_HMAC_SHA1_96 "password" "SALT" |> cryptoOk
     Assert.True((k1.contents = k2.contents))
 
 // ============================================================================
@@ -69,8 +75,8 @@ let ``encrypt + decrypt roundtrip with KeyUsage`` (usage : int) =
     let key = makeTestKey ()
     let plaintext = [| 1uy; 2uy; 3uy; 42uy; 99uy |] |> Array.append (Array.zeroCreate 20)
 
-    let ct = encrypt key usage plaintext None
-    let pt = decrypt key usage ct
+    let ct = encrypt key usage plaintext None |> cryptoOk
+    let pt = decrypt key usage ct |> cryptoOk
 
     Assert.True((plaintext = pt))
 
@@ -79,8 +85,8 @@ let ``encrypt includes confounder and MAC; decrypt strips them`` () =
     let key = makeTestKey ()
     let pt = Array.init 30 (fun i -> byte i)
 
-    let ct = encrypt key 1 pt None
-    let recovered = decrypt key 1 ct
+    let ct = encrypt key 1 pt None |> cryptoOk
+    let recovered = decrypt key 1 ct |> cryptoOk
 
     Assert.True((pt = recovered))
     // Ciphertext must be longer than plaintext (confounder + mac)
@@ -310,8 +316,8 @@ let ``full preauth AS-REQ construction + decrypt roundtrip`` () =
     // but we can at least ensure the encrypted portion is decryptable in principle
     // by exercising the same encrypt path used inside buildAsReqWithPreAuth.
     let paTsPlain = encodePaEncTsEnc now (Some (int (now.Ticks % 10000000L / 10L)))
-    let encryptedPa = encrypt key 1 paTsPlain None
-    let decryptedPa = decrypt key 1 encryptedPa
+    let encryptedPa = encrypt key 1 paTsPlain None |> cryptoOk
+    let decryptedPa = decrypt key 1 encryptedPa |> cryptoOk
 
     let parsedTs = parseBer decryptedPa
     match parsedTs with
@@ -326,10 +332,11 @@ let ``full preauth AS-REQ construction + decrypt roundtrip`` () =
 let ``decrypt with wrong usage throws on MAC verification (correct security behavior)`` () =
     let key = makeTestKey ()
     let pt = [| 99uy; 88uy; 77uy |]
-    let ct = encrypt key 3 pt None
-
-    // Current implementation validates MAC; wrong usage causes failure
-    Assert.Throws<System.ArgumentException>(fun () -> decrypt key 7 ct |> ignore) |> ignore
+    let ct = encrypt key 3 pt None |> cryptoOk
+    match decrypt key 7 ct with
+    | Error MacVerificationFailed -> ()
+    | Error e -> Assert.Fail $"expected MacVerificationFailed, got {e}"
+    | Ok _ -> Assert.Fail "expected MAC verification to fail"
 
 [<Fact>]
 let ``parseBer on invalid data does not throw (or throws controlled)`` () =
@@ -352,16 +359,16 @@ let ``stringToKey RC4 produces 16-byte MD4 key (RFC 4757 test vector)`` () =
            0xEAuy; 0x5Duy; 0x43uy; 0xBDuy
            0xAFuy; 0x78uy; 0x00uy; 0xCCuy |]
 
-    let key = stringToKey EncryptionType.ARCFOUR_HMAC_MD5 "foo" "salt is ignored"
+    let key = stringToKey EncryptionType.ARCFOUR_HMAC_MD5 "foo" "salt is ignored" |> cryptoOk
     Assert.Equal(EncryptionType.ARCFOUR_HMAC_MD5, key.enctype)
     Assert.Equal(16, key.contents.Length)
     Assert.True((key.contents = expected), $"""Expected {String.concat " " (expected |> Array.map (fun b -> b.ToString "X2"))} but got {String.concat " " (key.contents |> Array.map (fun b -> b.ToString "X2"))}""")
 
 [<Fact>]
 let ``stringToKey RC4 is deterministic and ignores salt`` () =
-    let k1 = stringToKey EncryptionType.ARCFOUR_HMAC_MD5 "password" "salt1"
-    let k2 = stringToKey EncryptionType.ARCFOUR_HMAC_MD5 "password" "salt2"
-    let k3 = stringToKey EncryptionType.ARCFOUR_HMAC_MD5 "password" ""
+    let k1 = stringToKey EncryptionType.ARCFOUR_HMAC_MD5 "password" "salt1" |> cryptoOk
+    let k2 = stringToKey EncryptionType.ARCFOUR_HMAC_MD5 "password" "salt2" |> cryptoOk
+    let k3 = stringToKey EncryptionType.ARCFOUR_HMAC_MD5 "password" "" |> cryptoOk
 
     Assert.True((k1.contents = k2.contents), "Salt should be ignored for RC4-HMAC-MD5")
     Assert.True((k1.contents = k3.contents), "Salt should be ignored for RC4-HMAC-MD5")
@@ -369,7 +376,7 @@ let ``stringToKey RC4 is deterministic and ignores salt`` () =
 [<Fact>]
 let ``stringToKey RC4 handles Unicode passwords`` () =
     // Unicode password — UTF-16LE encoding matters
-    let key = stringToKey EncryptionType.ARCFOUR_HMAC_MD5 "P@ssw0rd!" ""
+    let key = stringToKey EncryptionType.ARCFOUR_HMAC_MD5 "P@ssw0rd!" "" |> cryptoOk
     Assert.Equal(16, key.contents.Length)
     Assert.True(key.contents.Length = 16)
 
@@ -379,11 +386,11 @@ let ``stringToKey RC4 handles Unicode passwords`` () =
 
 [<Fact>]
 let ``RC4 encrypt + decrypt roundtrip with KeyUsage`` () =
-    let key = stringToKey EncryptionType.ARCFOUR_HMAC_MD5 "beefb33fBeef" ""
+    let key = stringToKey EncryptionType.ARCFOUR_HMAC_MD5 "beefb33fBeef" "" |> cryptoOk
     let plaintext = [| 1uy; 2uy; 3uy; 42uy; 99uy; 0uy; 0xFFuy |]
 
-    let ct = encrypt key KeyUsage.AsReqPaEncTs plaintext None
-    let pt = decrypt key KeyUsage.AsReqPaEncTs ct
+    let ct = encrypt key KeyUsage.AsReqPaEncTs plaintext None |> cryptoOk
+    let pt = decrypt key KeyUsage.AsReqPaEncTs ct |> cryptoOk
 
     Assert.True((plaintext = pt))
     // Ciphertext must be longer (checksum + confounder)
@@ -397,11 +404,11 @@ let ``RC4 encrypt + decrypt roundtrip with KeyUsage`` () =
 [<InlineData(11)>]
 [<InlineData(12)>]
 let ``RC4 encrypt + decrypt roundtrip for various KeyUsages`` (usage : int) =
-    let key = stringToKey EncryptionType.ARCFOUR_HMAC_MD5 "TestPassword123" ""
+    let key = stringToKey EncryptionType.ARCFOUR_HMAC_MD5 "TestPassword123" "" |> cryptoOk
     let plaintext = Array.init 64 (fun i -> byte (i * 7 % 256))
 
-    let ct = encrypt key usage plaintext None
-    let pt = decrypt key usage ct
+    let ct = encrypt key usage plaintext None |> cryptoOk
+    let pt = decrypt key usage ct |> cryptoOk
 
     Assert.True((plaintext = pt))
 
@@ -413,21 +420,23 @@ let ``RC4 encrypt + decrypt roundtrip for various KeyUsages`` (usage : int) =
 [<InlineData(100)>]
 [<InlineData(256)>]
 let ``RC4 encrypt + decrypt roundtrip for various plaintext lengths`` (len : int) =
-    let key = stringToKey EncryptionType.ARCFOUR_HMAC_MD5 "password" ""
+    let key = stringToKey EncryptionType.ARCFOUR_HMAC_MD5 "password" "" |> cryptoOk
     let plaintext = Array.init len (fun i -> byte (i % 256))
 
-    let ct = encrypt key KeyUsage.AsRepEncPart plaintext None
-    let pt = decrypt key KeyUsage.AsRepEncPart ct
+    let ct = encrypt key KeyUsage.AsRepEncPart plaintext None |> cryptoOk
+    let pt = decrypt key KeyUsage.AsRepEncPart ct |> cryptoOk
 
     Assert.True((plaintext = pt))
 
 [<Fact>]
 let ``RC4 decrypt with wrong usage throws on MAC verification`` () =
-    let key = stringToKey EncryptionType.ARCFOUR_HMAC_MD5 "test" ""
+    let key = stringToKey EncryptionType.ARCFOUR_HMAC_MD5 "test" "" |> cryptoOk
     let pt = [| 99uy; 88uy; 77uy |]
-    let ct = encrypt key KeyUsage.AsReqPaEncTs pt None
-
-    Assert.Throws<System.ArgumentException>(fun () -> decrypt key KeyUsage.TgsReqAuth ct |> ignore) |> ignore
+    let ct = encrypt key KeyUsage.AsReqPaEncTs pt None |> cryptoOk
+    match decrypt key KeyUsage.TgsReqAuth ct with
+    | Error MacVerificationFailed -> ()
+    | Error e -> Assert.Fail $"expected MacVerificationFailed, got {e}"
+    | Ok _ -> Assert.Fail "expected MAC verification to fail"
 
 // ============================================================================
 // 13. AES128 encrypt / decrypt roundtrip (RFC 3962)
@@ -435,14 +444,14 @@ let ``RC4 decrypt with wrong usage throws on MAC verification`` () =
 
 [<Fact>]
 let ``stringToKey AES128 produces deterministic 16-byte key`` () =
-    let key = stringToKey EncryptionType.AES128_CTS_HMAC_SHA1_96 "testPassword" "TESTREALMuser"
+    let key = stringToKey EncryptionType.AES128_CTS_HMAC_SHA1_96 "testPassword" "TESTREALMuser" |> cryptoOk
     Assert.Equal(EncryptionType.AES128_CTS_HMAC_SHA1_96, key.enctype)
     Assert.Equal(16, key.contents.Length)
 
 [<Fact>]
 let ``stringToKey AES128 is stable across calls`` () =
-    let k1 = stringToKey EncryptionType.AES128_CTS_HMAC_SHA1_96 "password" "SALT"
-    let k2 = stringToKey EncryptionType.AES128_CTS_HMAC_SHA1_96 "password" "SALT"
+    let k1 = stringToKey EncryptionType.AES128_CTS_HMAC_SHA1_96 "password" "SALT" |> cryptoOk
+    let k2 = stringToKey EncryptionType.AES128_CTS_HMAC_SHA1_96 "password" "SALT" |> cryptoOk
     Assert.True((k1.contents = k2.contents))
 
 [<Theory>]
@@ -453,11 +462,11 @@ let ``stringToKey AES128 is stable across calls`` () =
 [<InlineData(11)>]
 [<InlineData(12)>]
 let ``AES128 encrypt + decrypt roundtrip for various KeyUsages`` (usage : int) =
-    let key = stringToKey EncryptionType.AES128_CTS_HMAC_SHA1_96 "TestPassword123" "TESTREALMuser"
+    let key = stringToKey EncryptionType.AES128_CTS_HMAC_SHA1_96 "TestPassword123" "TESTREALMuser" |> cryptoOk
     let plaintext = Array.init 64 (fun i -> byte (i * 7 % 256))
 
-    let ct = encrypt key usage plaintext None
-    let pt = decrypt key usage ct
+    let ct = encrypt key usage plaintext None |> cryptoOk
+    let pt = decrypt key usage ct |> cryptoOk
 
     Assert.True((plaintext = pt))
 
@@ -469,35 +478,37 @@ let ``AES128 encrypt + decrypt roundtrip for various KeyUsages`` (usage : int) =
 [<InlineData(100)>]
 [<InlineData(256)>]
 let ``AES128 encrypt + decrypt roundtrip for various plaintext lengths`` (len : int) =
-    let key = stringToKey EncryptionType.AES128_CTS_HMAC_SHA1_96 "password" "REALMuser"
+    let key = stringToKey EncryptionType.AES128_CTS_HMAC_SHA1_96 "password" "REALMuser" |> cryptoOk
     let plaintext = Array.init len (fun i -> byte (i % 256))
 
-    let ct = encrypt key KeyUsage.AsRepEncPart plaintext None
-    let pt = decrypt key KeyUsage.AsRepEncPart ct
+    let ct = encrypt key KeyUsage.AsRepEncPart plaintext None |> cryptoOk
+    let pt = decrypt key KeyUsage.AsRepEncPart ct |> cryptoOk
 
     Assert.True((plaintext = pt))
 
 [<Fact>]
 let ``AES128 decrypt with wrong usage throws on MAC verification`` () =
-    let key = stringToKey EncryptionType.AES128_CTS_HMAC_SHA1_96 "test" "REALMuser"
+    let key = stringToKey EncryptionType.AES128_CTS_HMAC_SHA1_96 "test" "REALMuser" |> cryptoOk
     let pt = [| 99uy; 88uy; 77uy |]
-    let ct = encrypt key KeyUsage.AsReqPaEncTs pt None
-
-    Assert.Throws<System.ArgumentException>(fun () -> decrypt key KeyUsage.TgsReqAuth ct |> ignore) |> ignore
+    let ct = encrypt key KeyUsage.AsReqPaEncTs pt None |> cryptoOk
+    match decrypt key KeyUsage.TgsReqAuth ct with
+    | Error MacVerificationFailed -> ()
+    | Error e -> Assert.Fail $"expected MacVerificationFailed, got {e}"
+    | Ok _ -> Assert.Fail "expected MAC verification to fail"
 
 [<Fact>]
 let ``AES128 full preauth AS-REQ construction + decrypt roundtrip`` () =
     let password = "testPassword123"
     let salt = "TESTREALMAdministrator"
-    let key = stringToKey EncryptionType.AES128_CTS_HMAC_SHA1_96 password salt
+    let key = stringToKey EncryptionType.AES128_CTS_HMAC_SHA1_96 password salt |> cryptoOk
     let now = DateTime.UtcNow
 
     let asReq = buildAsReqWithPreAuth "Administrator" "TESTREALM" key now
 
     // The request contains encrypted PA-DATA. Verify the encrypted portion is decryptable.
     let paTsPlain = encodePaEncTsEnc now (Some (int (now.Ticks % 10000000L / 10L)))
-    let encryptedPa = encrypt key 1 paTsPlain None
-    let decryptedPa = decrypt key 1 encryptedPa
+    let encryptedPa = encrypt key 1 paTsPlain None |> cryptoOk
+    let decryptedPa = decrypt key 1 encryptedPa |> cryptoOk
 
     let parsedTs = parseBer decryptedPa
     match parsedTs with

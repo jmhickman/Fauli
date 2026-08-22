@@ -626,24 +626,10 @@ let private truncateToSmbKey (keyBytes : byte array) : byte array =
     Array.sub keyBytes 0 (min 16 keyBytes.Length)
 
 
-let private tryDecryptWith (key : Key) (cipher : byte array) (decryptFn : Key -> int -> byte array -> byte array) : byte array option =
-    try
-        match decryptFn key KeyUsage.ApRepEncPart cipher with
-        | plain when plain.Length > 8 -> Some plain
-        | _ -> None
-    with _ ->
-        None
-
-
-///
-/// Decrypt EncAPRepPart with the ticket session key and negotiated etype.
 let private tryDecryptEncApRepPart (keyBytes : byte array) (etype : int) (cipher : byte array) : byte array option =
-    let krbKey =
-        { enctype = enum<EncryptionType> etype
-          contents = keyBytes }
-    match tryDecryptWith krbKey cipher decrypt with
-    | Some plain -> Some plain
-    | None -> tryDecryptWith krbKey cipher decryptApRepCipher
+    match decrypt { enctype = enum<EncryptionType> etype; contents = keyBytes } KeyUsage.ApRepEncPart cipher with
+    | Ok plain when plain.Length > 8 -> Some plain
+    | _ -> None
 
 
 ///

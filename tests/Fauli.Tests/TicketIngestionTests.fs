@@ -7,6 +7,11 @@ open Fauli.Kerberos.Encoding
 open Fauli.Kerberos.Encryption
 open Fauli.Kerberos.TicketIngestion
 
+let private cryptoOk result =
+    match result with
+    | Ok v -> v
+    | Error e -> failwith $"expected Ok, got {e}"
+
 // ============================================================================
 // Helpers — build synthetic .kirbi (KRB-CRED) data
 // ============================================================================
@@ -649,7 +654,7 @@ let ``writeCcache handles missing cname and crealm`` () =
 
 [<Fact>]
 let ``writeCcache preserves RC4 session key`` () =
-    let key = stringToKey EncryptionType.ARCFOUR_HMAC_MD5 "password" ""
+    let key = stringToKey EncryptionType.ARCFOUR_HMAC_MD5 "password" "" |> cryptoOk
     let tgt : TgtResult =
         { ticketBytes = Array.zeroCreate 80
           sessionKey = key
