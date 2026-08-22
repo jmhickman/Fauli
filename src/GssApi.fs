@@ -541,7 +541,7 @@ let private encryptedDataEtypeAndCipher (encPart : BerValue) : (int * byte array
     | Some fields ->
         let etype =
             match contextAt fields 0 with
-            | Some v -> asInteger v
+            | Some v -> defaultArg (asInteger v) (int EncryptionType.AES256_CTS_HMAC_SHA1_96)
             | None -> int EncryptionType.AES256_CTS_HMAC_SHA1_96
         match contextAt fields 2 with
         | None -> None

@@ -233,11 +233,8 @@ let ``extractTicketBytes and extractEncPart work on minimal KDC-REP shape`` () =
 
     // The extractors are strict; just ensure they don't blow up on this shape
     // (real responses have deeper nesting)
-    try
-        let _ = extractTicketBytes (parseBer rep)
-        let _ = extractEncPartCipher (parseBer rep)
-        ()
-    with _ -> ()
+    extractTicketBytes (parseBer rep) |> ignore
+    extractEncPartCipher (parseBer rep) |> ignore
 
 // ============================================================================
 // 7. TGS Request Building & skew correction

@@ -119,7 +119,7 @@ let internal extractEtypeFromEntry (entry : BerValue) : (int * string option) op
     | BerSequence fields ->
         let etype =
             match contextAt fields 0 with
-            | Some v -> asInteger v
+            | Some v -> defaultArg (asInteger v) -1
             | None -> -1
         let salt =
             match contextAt fields 1 with
@@ -139,11 +139,7 @@ let internal extractEtypesFromOctetField (fields : BerValue list) : (int * strin
         | None -> None
         | Some v -> extractOctetBytesFromValue v
     let parseAsSequence (bytes : byte array) : BerValue list option =
-        try
-            match parseBer bytes with
-            | BerSequence entries -> Some entries
-            | _ -> None
-        with _ -> None
+        asSequence (parseBer bytes)
     let chooseEtypes (entries : BerValue list) : (int * string option) list =
         entries |> List.choose extractEtypeFromEntry
     match extractOctetBytes fields |> Option.bind parseAsSequence with
@@ -172,7 +168,7 @@ let internal extractEtypesFromPaData (paData : BerValue) : (int * string option)
     | BerSequence fields ->
         let paType =
             match contextAt fields 1 with
-            | Some v -> asInteger v
+            | Some v -> defaultArg (asInteger v) -1
             | None -> -1
         match paType with
         | n when n = paEtypeInfo || n = paEtypeInfo2 ->
@@ -408,11 +404,11 @@ let private checkPreAuthAsRep (asRep : byte array) : Result<BerValue, AuthError>
 let private extractSessionKeyBytes (encAsRepPart : BerValue) (encEtype : int) : Key option =
     let extractKeyBytesFromKf (kf : BerValue list) : byte array option =
         match contextAt kf 1 with
-        | Some v -> Some (asOctetString v)
+        | Some v -> asOctetString v
         | None -> None
     let extractKeyTypeFromKf (kf : BerValue list) : int option =
         match contextAt kf 0 with
-        | Some v -> Some (asInteger v)
+        | Some v -> asInteger v
         | None -> None
     let keyFieldsFromContext0 (fields : BerValue list) : BerValue list option =
         match contextAt fields 0 with
@@ -441,28 +437,23 @@ let private extractSessionKeyBytes (encAsRepPart : BerValue) (encEtype : int) : 
 ///
 /// Decrypt the AS-REP enc-part and extract the TGT session key.
 let private extractTgtSessionKey (rep : BerValue) (etype : EncryptionType) (key : Key) (saltStr : string) (password : string) : Result<TgtResult, AuthError> =
-    let encCipher = extractEncPartCipher rep
-    let encEtype = extractEncPartEtype rep
-    let decryptKey =
-        match encEtype = int etype with
-        | true -> key
-        | false ->
-            stringToKey (enum<EncryptionType> encEtype) password saltStr
-    let decryptedBytes = decrypt decryptKey KeyUsage.AsRepEncPart encCipher
-    let encAsRepPart = parseBer decryptedBytes
-    match extractSessionKeyBytes encAsRepPart encEtype with
-    | Some sessionKey ->
-        let ticketBytes = extractTicketBytes rep
-        let cname = extractCname rep
-        let crealm = extractCrealm rep
-        { ticketBytes = ticketBytes
-          sessionKey = sessionKey
-          sessionKeyType = int sessionKey.enctype
-          cname = cname
-          crealm = crealm
-          serverTime = None } |> Ok
-    | None ->
-        KerberosTGTAcquisitionFailed |> Error
+    match extractEncPartCipher rep, extractEncPartEtype rep with
+    | None, _ | _, None -> KerberosTGTAcquisitionFailed |> Error
+    | Some encCipher, Some encEtype ->
+        let decryptKey =
+            match encEtype = int etype with
+            | true -> key
+            | false -> stringToKey (enum<EncryptionType> encEtype) password saltStr
+        let encAsRepPart = parseBer (decrypt decryptKey KeyUsage.AsRepEncPart encCipher)
+        match extractSessionKeyBytes encAsRepPart encEtype, extractTicketBytes rep with
+        | None, _ | _, None -> KerberosTGTAcquisitionFailed |> Error
+        | Some sessionKey, Some ticketBytes ->
+            { ticketBytes = ticketBytes
+              sessionKey = sessionKey
+              sessionKeyType = int sessionKey.enctype
+              cname = extractCname rep
+              crealm = extractCrealm rep
+              serverTime = None } |> Ok
 
 
 ///
@@ -689,7 +680,7 @@ let private encodeCnameBytes (cname : BerValue) : byte array =
     let parseCnameFields (cnameFields : BerValue list) : byte array =
         let nameType =
             match contextAt cnameFields 0 with
-            | Some v -> asInteger v
+            | Some v -> defaultArg (asInteger v) Fauli.Constants.Kerberos.NamePrincipal
             | None -> Fauli.Constants.Kerberos.NamePrincipal
         encodePrincipalName nameType (nameStringsFromContext cnameFields)
     match cname with
@@ -759,11 +750,11 @@ let internal extractServiceKey
     let extractKeyFromKf (keyFields : BerValue list) : Key option =
         let keyType =
             match contextAt keyFields 0 with
-            | Some v -> Some (asInteger v)
+            | Some v -> asInteger v
             | None -> None
         let keyBytes =
             match contextAt keyFields 1 with
-            | Some v -> Some (asOctetString v)
+            | Some v -> asOctetString v
             | None -> None
         match keyType, keyBytes with
         | Some kt, Some kb -> Some (buildKeyFromTypes kt kb)
@@ -801,6 +792,37 @@ let private extractTgsCrealm (encTgsRepPart : BerValue) : string option =
 
 
 ///
+/// Decrypt TGS-REP enc-part after cipher extraction.
+let private decryptTgsEncPart (tgt : TgtResult) (rep : BerValue) : Result<BerValue, AuthError> =
+    match extractEncPartCipher rep with
+    | None -> KerberosServiceTicketFailed |> Error
+    | Some cipher ->
+        parseBer (decrypt tgt.sessionKey KeyUsage.TgsRepEncPartSesskey cipher) |> Ok
+
+
+///
+/// Package a service ticket after the TGS-REP enc-part is decrypted.
+let private completeServiceTicket (tgt : TgtResult) (rep : BerValue) (encTgsRepPart : BerValue) : Result<ServiceTicketResult, AuthError> =
+    match extractServiceKey encTgsRepPart, extractTicketBytes rep with
+    | None, _ | _, None -> KerberosServiceTicketFailed |> Error
+    | Some svcSessionKey, Some ticketBytes ->
+        { ticketBytes = ticketBytes
+          sessionKey = svcSessionKey
+          encPart = encTgsRepPart
+          cname = extractTgsCname encTgsRepPart |> Option.map Some |> Option.defaultValue tgt.cname
+          crealm = extractTgsCrealm encTgsRepPart |> Option.map Some |> Option.defaultValue tgt.crealm } |> Ok
+
+
+///
+/// Continue TGS after the KDC reply is known not to be a KRB-ERROR.
+let private finishServiceTicketAfterReply (tgt : TgtResult) (tgsRep : byte array) : Result<ServiceTicketResult, AuthError> =
+    let rep = decodeKdcRep tgsRep
+    match decryptTgsEncPart tgt rep with
+    | Error e -> e |> Error
+    | Ok encTgsRepPart -> completeServiceTicket tgt rep encTgsRepPart
+
+
+///
 /// Build the service ticket acquisition pipeline.
 let private acquireServiceTicket (kdcHost : string) (tgt : TgtResult) (spn : string) (realm : string) : Result<ServiceTicketResult, AuthError> =
     let crealm = defaultArg tgt.crealm realm
@@ -816,28 +838,7 @@ let private acquireServiceTicket (kdcHost : string) (tgt : TgtResult) (spn : str
         |> sendKdcRequest kdcHost 88
     match isKrbError tgsRep with
     | true -> KerberosServiceTicketFailed |> Error
-    | false ->
-        let rep = decodeKdcRep tgsRep
-        let encTgsRepPart =
-            parseBer (decrypt tgt.sessionKey KeyUsage.TgsRepEncPartSesskey
-                        (extractEncPartCipher rep))
-        match extractServiceKey encTgsRepPart with
-        | None -> KerberosServiceTicketFailed |> Error
-        | Some svcSessionKey ->
-            let ticketBytes = extractTicketBytes rep
-            let resultCname =
-                extractTgsCname encTgsRepPart
-                |> Option.map Some
-                |> Option.defaultValue tgt.cname
-            let resultCrealm =
-                extractTgsCrealm encTgsRepPart
-                |> Option.map Some
-                |> Option.defaultValue tgt.crealm
-            { ticketBytes = ticketBytes
-              sessionKey = svcSessionKey
-              encPart = encTgsRepPart
-              cname = resultCname
-              crealm = resultCrealm } |> Ok
+    | false -> finishServiceTicketAfterReply tgt tgsRep
 
 
 let internal getServiceTicket (kdcHost : string) (tgt : TgtResult) (spn : string) (realm : string) : Result<ServiceTicketResult, AuthError> =

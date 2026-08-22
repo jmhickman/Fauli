@@ -27,63 +27,127 @@ type ParserState =
       pos : int }
 
 
-let private checkLength (state : ParserState) (needed : int) : unit =
+type BerParseError =
+    | TruncatedInput
+
+
+let private requireBytes (state : ParserState) (needed : int) : Result<ParserState, BerParseError> =
     match state.pos + needed > state.data.Length with
-    | true -> invalidArg "data" $"Expected {needed} bytes at position {state.pos}, but only {state.data.Length - state.pos} remaining"
-    | false -> ()
+    | true -> TruncatedInput |> Error
+    | false -> state |> Ok
 
 
-let private readBytes (state : ParserState) (count : int) : byte array * ParserState =
-    checkLength state count
-    let bytes = Array.sub state.data state.pos count
-    bytes, { state with pos = state.pos + count }
+let private readBytes (state : ParserState) (count : int) : Result<byte array * ParserState, BerParseError> =
+    match requireBytes state count with
+    | Error e -> e |> Error
+    | Ok ready ->
+        (Array.sub ready.data ready.pos count, { ready with pos = ready.pos + count }) |> Ok
 
 
-let private readByte (state : ParserState) : byte * ParserState =
-    checkLength state 1
-    state.data.[state.pos], { state with pos = state.pos + 1 }
+let private readByte (state : ParserState) : Result<byte * ParserState, BerParseError> =
+    match requireBytes state 1 with
+    | Error e -> e |> Error
+    | Ok ready ->
+        (ready.data.[ready.pos], { ready with pos = ready.pos + 1 }) |> Ok
 
 
-let private parseTag (state : ParserState) : BerTag * ParserState =
-    let tagByte, afterTagByte = readByte state
-    let tagClass = int tagByte >>> 6
-    let constructed = (tagByte &&& 0x20uy) <> 0uy
-    let tagNumLow = int (tagByte &&& 0x1Fuy)
-
-    match tagNumLow < 31 with
-    | true -> { tagClass = tagClass; constructed = constructed; tagNumber = tagNumLow }, afterTagByte
-    | false ->
-        let rec loop (st : ParserState) (acc : int) : int * ParserState =
-            let b, next = readByte st
-            let acc' = acc <<< 8 ||| (int b &&& 0x7F)
-            match b &&& 0x80uy <> 0uy with
-            | true -> loop next acc'
-            | false -> acc', next
-        let tagNum, afterTag = loop afterTagByte 0
-        { tagClass = tagClass; constructed = constructed; tagNumber = tagNum }, afterTag
+///
+/// High bit set means another septet follows ([X.690] §8.1.2.4).
+let private hasMoreTagOctets (b : byte) : bool =
+    b &&& 0x80uy <> 0uy
 
 
-let private parseLength (state : ParserState) : int * ParserState =
-    let lenByte, afterLenByte = readByte state
-    match lenByte &&& 0x80uy = 0uy with
-    | true -> int lenByte, afterLenByte
-    | false ->
-        let numLenBytes = int (lenByte &&& 0x0Fuy)
-        checkLength afterLenByte numLenBytes
-        let lenBytes, afterLenBytes = readBytes afterLenByte numLenBytes
-        let rec assemble idx acc =
-            match idx >= lenBytes.Length with
-            | true -> acc
-            | false -> assemble (idx + 1) (acc <<< 8 ||| int lenBytes.[idx])
-        assemble 0 0, afterLenBytes
+///
+/// Fold one 7-bit tag-number septet into the accumulator.
+let private appendTagSeptet (acc : int) (b : byte) : int =
+    acc <<< 7 ||| (int b &&& 0x7F)
 
 
-let private parseTlv (state : ParserState) : BerTag * byte array * ParserState =
-    let tag, afterTag = parseTag state
-    let len, afterLength = parseLength afterTag
-    checkLength afterLength len
-    let value, afterValue = readBytes afterLength len
-    tag, value, afterValue
+///
+/// Long-form tag number: septets until the continuation bit clears.
+let private parseLongTagNumber (state : ParserState) : Result<int * ParserState, BerParseError> =
+    let rec readSeptets st acc =
+        match readByte st with
+        | Error e -> e |> Error
+        | Ok (b, next) ->
+            let tagNumber = appendTagSeptet acc b
+            match hasMoreTagOctets b with
+            | true -> readSeptets next tagNumber
+            | false -> (tagNumber, next) |> Ok
+    readSeptets state 0
+
+
+///
+/// Short-form tag number when the low five bits are not the 0x1F escape.
+let private shortFormTagNumber (tagByte : byte) : int option =
+    match int (tagByte &&& 0x1Fuy) with
+    | n when n < 31 -> Some n
+    | _ -> None
+
+
+let private berTag (tagByte : byte) (tagNumber : int) : BerTag =
+    { tagClass = int tagByte >>> 6
+      constructed = tagByte &&& 0x20uy <> 0uy
+      tagNumber = tagNumber }
+
+
+let private attachLongTagNumber (tagByte : byte) (afterFirst : ParserState) : Result<BerTag * ParserState, BerParseError> =
+    match parseLongTagNumber afterFirst with
+    | Error e -> e |> Error
+    | Ok (tagNumber, afterTag) -> (berTag tagByte tagNumber, afterTag) |> Ok
+
+
+let private tagFromFirstByte (tagByte : byte) (afterFirst : ParserState) : Result<BerTag * ParserState, BerParseError> =
+    match shortFormTagNumber tagByte with
+    | Some n -> (berTag tagByte n, afterFirst) |> Ok
+    | None -> attachLongTagNumber tagByte afterFirst
+
+
+let private parseTag (state : ParserState) : Result<BerTag * ParserState, BerParseError> =
+    match readByte state with
+    | Error e -> e |> Error
+    | Ok (tagByte, afterFirst) -> tagFromFirstByte tagByte afterFirst
+
+
+let private assembleLength (lenBytes : byte array) : int =
+    let rec loop idx acc =
+        match idx >= lenBytes.Length with
+        | true -> acc
+        | false -> loop (idx + 1) (acc <<< 8 ||| int lenBytes.[idx])
+    loop 0 0
+
+
+let private parseLongLength (afterLenByte : ParserState) (numLenBytes : int) : Result<int * ParserState, BerParseError> =
+    match readBytes afterLenByte numLenBytes with
+    | Error e -> e |> Error
+    | Ok (lenBytes, afterLenBytes) -> (assembleLength lenBytes, afterLenBytes) |> Ok
+
+
+let private parseLength (state : ParserState) : Result<int * ParserState, BerParseError> =
+    match readByte state with
+    | Error e -> e |> Error
+    | Ok (lenByte, afterLenByte) ->
+        match lenByte &&& 0x80uy = 0uy with
+        | true -> (int lenByte, afterLenByte) |> Ok
+        | false -> parseLongLength afterLenByte (int (lenByte &&& 0x0Fuy))
+
+
+let private parseTlvValue (tag : BerTag) (afterLength : ParserState) (len : int) : Result<BerTag * byte array * ParserState, BerParseError> =
+    match readBytes afterLength len with
+    | Error e -> e |> Error
+    | Ok (value, afterValue) -> (tag, value, afterValue) |> Ok
+
+
+let private parseTlvAfterTag (tag : BerTag) (afterTag : ParserState) : Result<BerTag * byte array * ParserState, BerParseError> =
+    match parseLength afterTag with
+    | Error e -> e |> Error
+    | Ok (len, afterLength) -> parseTlvValue tag afterLength len
+
+
+let private parseTlv (state : ParserState) : Result<BerTag * byte array * ParserState, BerParseError> =
+    match parseTag state with
+    | Error e -> e |> Error
+    | Ok (tag, afterTag) -> parseTlvAfterTag tag afterTag
 
 
 ///
@@ -147,19 +211,30 @@ and private unwrapSingleSequence (innerValue : byte array) : BerValue =
 
 
 ///
+/// Decode a complete explicit context inner TLV.
+and private decodeCompleteContextInner (innerTag : BerTag) (innerValue : byte array) : BerValue =
+    match innerTag.tagClass = 1 && innerTag.constructed with
+    | true -> unwrapSingleSequence innerValue
+    | false -> parseUniversalValue innerTag innerValue
+
+
+///
 /// Try to parse a context-tagged inner value (explicit Kerberos tags).
-and private tryParseContextInner (tag : BerTag) (content : byte array) : BerValue =
-    try
-        let innerTag, innerValue, innerNext = parseTlv { data = content; pos = 0 }
+and private tryParseContextInner (content : byte array) : Result<BerValue, BerParseError> =
+    match parseTlv { data = content; pos = 0 } with
+    | Error e -> e |> Error
+    | Ok (innerTag, innerValue, innerNext) ->
         match isCompleteInnerTlv innerNext content with
-        | true ->
-            match innerTag.tagClass = 1 && innerTag.constructed with
-            | true -> unwrapSingleSequence innerValue
-            | false -> parseUniversalValue innerTag innerValue
-        | false ->
-            parseUniversalValue tag content
-    with _ ->
-        parseUniversalValue tag content
+        | false -> TruncatedInput |> Error
+        | true -> decodeCompleteContextInner innerTag innerValue |> Ok
+
+
+///
+/// Context inner value, or the content interpreted as a universal value.
+and private contextInnerOrRaw (tag : BerTag) (content : byte array) : BerValue =
+    match tryParseContextInner content with
+    | Ok inner -> inner
+    | Error _ -> parseUniversalValue tag content
 
 
 ///
@@ -167,75 +242,82 @@ and private tryParseContextInner (tag : BerTag) (content : byte array) : BerValu
 and private parseOneBerValue (tag : BerTag) (content : byte array) : BerValue =
     match tag with
     | { tagClass = 2 } ->
-        (tag.tagNumber, tryParseContextInner tag content) |> BerContext
+        (tag.tagNumber, contextInnerOrRaw tag content) |> BerContext
     | { constructed = true } ->
         parseConstructed content |> BerSequence
     | _ ->
         parseUniversalValue tag content
 
 
+and private parseRemainingElements (state : ParserState) : BerValue list =
+    match parseTlv state with
+    | Error _ -> []
+    | Ok (tag, content, nextState) ->
+        parseOneBerValue tag content :: parseConstructedFrom nextState
+
+
+and private parseConstructedFrom (state : ParserState) : BerValue list =
+    match state.pos >= state.data.Length with
+    | true -> []
+    | false -> parseRemainingElements state
+
+
 and private parseConstructed (value : byte array) : BerValue list =
-    let rec loop (state : ParserState) : BerValue list =
-        match state.pos >= state.data.Length with
-        | true -> []
-        | false ->
-            let tag, content, nextState = parseTlv state
-            parseOneBerValue tag content :: loop nextState
-    loop { data = value; pos = 0 }
+    parseConstructedFrom { data = value; pos = 0 }
 
 
-let parseBer (data : byte array) : BerValue =
-    let state = { data = data; pos = 0 }
-    let tag, value, _ = parseTlv state
+let private decodeTopLevel (tag : BerTag) (value : byte array) : BerValue =
     match tag.tagClass = 1 with
     | true ->
         match parseConstructed value with
-        | [v] -> v  // single inner value — return it directly
+        | [v] -> v
         | vs -> BerSequence vs
-    | false ->
-        parseUniversalValue tag value
+    | false -> parseUniversalValue tag value
+
+
+let parseBer (data : byte array) : BerValue =
+    match parseTlv { data = data; pos = 0 } with
+    | Error _ -> BerRaw data
+    | Ok (tag, value, _) -> decodeTopLevel tag value
 
 
 ///
-/// Structural converters — throw `ArgumentException` on mismatch.
-/// Callers in Auth.fs are wrapped in `try...with` at the boundary (`getTgt`/`getServiceTicket`),
-/// so these exceptions surface as `UnexpectedError` (not domain validation errors).
-/// 
-let asInteger (v : BerValue) : int =
+/// Structural converters. None when the BER value is the wrong shape.
+let asInteger (v : BerValue) : int option =
     match v with
-    | BerInteger n -> n
-    | BerSequence [BerInteger n] -> n  // explicit context tag unwraps to SEQUENCE of one INTEGER
-    | _ -> invalidArg "value" $"Expected BerInteger, got {v}"
+    | BerInteger n -> Some n
+    | BerSequence [BerInteger n] -> Some n
+    | _ -> None
 
 
-let asOctetString (v : BerValue) : byte array =
+let asOctetString (v : BerValue) : byte array option =
     match v with
-    | BerOctetString b -> b
-    | BerSequence [BerOctetString b] -> b
-    | _ -> invalidArg "value" $"Expected BerOctetString, got {v}"
+    | BerOctetString b -> Some b
+    | BerSequence [BerOctetString b] -> Some b
+    | _ -> None
 
 
-let asGeneralString (v : BerValue) : string =
+let asGeneralString (v : BerValue) : string option =
     match v with
-    | BerGeneralString s -> s
-    | BerSequence [BerGeneralString s] -> s
-    | _ -> invalidArg "value" $"Expected BerGeneralString, got {v}"
+    | BerGeneralString s -> Some s
+    | BerSequence [BerGeneralString s] -> Some s
+    | _ -> None
 
 
-let asGeneralizedTime (v : BerValue) : DateTime =
+let asGeneralizedTime (v : BerValue) : DateTime option =
     match v with
-    | BerGeneralizedTime dt -> dt
-    | _ -> invalidArg "value" $"Expected BerGeneralizedTime, got {v}"
+    | BerGeneralizedTime dt -> Some dt
+    | _ -> None
 
 
-let asSequence (v : BerValue) : BerValue list =
+let asSequence (v : BerValue) : BerValue list option =
     match v with
-    | BerSequence items -> items
-    | _ -> invalidArg "value" $"Expected BerSequence, got {v}"
+    | BerSequence items -> Some items
+    | _ -> None
 
 
-let atIndex (items : BerValue list) (idx : int) : BerValue =
-    List.item idx items
+let atIndex (items : BerValue list) (idx : int) : BerValue option =
+    List.tryItem idx items
 
 
 ///
@@ -249,22 +331,25 @@ let contextAt (items : BerValue list) (tag : int) : BerValue option =
 
 
 let parseOctetStringContent (v : BerValue) : BerValue =
-    v |> asOctetString |> parseBer
+    match asOctetString v with
+    | Some bytes -> parseBer bytes
+    | None -> BerRaw [||]
 
 
 ///
 /// Get the top-level APPLICATION tag number
 let applicationTag (data : byte array) : int =
-    let tag, _ = parseTag { data = data; pos = 0 }
-    tag.tagNumber
+    match parseTag { data = data; pos = 0 } with
+    | Error _ -> -1
+    | Ok (tag, _) -> tag.tagNumber
 
 
 ///
 /// Extract error code from KRB-ERROR fields [6].
 let private extractErrorCodeContext (v : BerValue) : int =
     match v with
-    | BerContext (_, inner) -> asInteger inner
-    | _ -> asInteger v
+    | BerContext (_, inner) -> defaultArg (asInteger inner) -1
+    | _ -> defaultArg (asInteger v) -1
 
 
 let private extractErrorCode (fields : BerValue list) : int =
@@ -295,12 +380,9 @@ let private extractErrorText (fields : BerValue list) : string option =
 /// [8] cname (opt), [9] realm, [10] sname, [11] e-text (opt), [12] e-data (opt)
 /// 
 let decodeKrbError (data : byte array) : int * string option =
-    try
-        match parseBer data with
-        | BerSequence fields -> extractErrorCode fields, extractErrorText fields
-        | _ -> -1, None
-    with _ ->
-        -1, None
+    match parseBer data with
+    | BerSequence fields -> extractErrorCode fields, extractErrorText fields
+    | _ -> -1, None
 
 
 let isKrbError (data : byte array) : bool =
@@ -324,9 +406,7 @@ let private toGeneralString (v : BerValue) : string option =
 let private unwrapTicketInner (v : BerValue) : BerValue =
     match v with
     | BerContext (_, inner) -> inner
-    | BerRaw b ->
-        try parseBer b
-        with _ -> BerSequence []
+    | BerRaw b -> parseBer b
     | other -> other
 
 
@@ -355,7 +435,7 @@ let private extractSnStrings (ss : BerValue list) : string array =
 let private extractSnameParts (snFields : BerValue list) : byte array =
     let snType =
         match contextAt snFields 0 with
-        | Some v -> asInteger v
+        | Some v -> defaultArg (asInteger v) 1
         | None -> 1
     let snStrs =
         match contextAt snFields 1 with
@@ -368,7 +448,7 @@ let private extractSnameParts (snFields : BerValue list) : byte array =
 /// Integer under a context tag, or a default when missing.
 let private integerAtOr (fields : BerValue list) (tag : int) (defaultValue : int) : int =
     match contextAt fields tag with
-    | Some v -> asInteger v
+    | Some v -> defaultArg (asInteger v) defaultValue
     | None -> defaultValue
 
 
@@ -376,7 +456,7 @@ let private integerAtOr (fields : BerValue list) (tag : int) (defaultValue : int
 /// GeneralString under a context tag, or empty when missing.
 let private generalStringAtOrEmpty (fields : BerValue list) (tag : int) : string =
     match contextAt fields tag with
-    | Some v -> asGeneralString v
+    | Some v -> defaultArg (asGeneralString v) ""
     | None -> ""
 
 
@@ -384,7 +464,7 @@ let private generalStringAtOrEmpty (fields : BerValue list) (tag : int) : string
 /// OCTET STRING under a context tag, or empty when missing.
 let private octetStringAtOrEmpty (fields : BerValue list) (tag : int) : byte array =
     match contextAt fields tag with
-    | Some v -> asOctetString v
+    | Some v -> defaultArg (asOctetString v) [||]
     | None -> [||]
 
 
@@ -392,7 +472,7 @@ let private octetStringAtOrEmpty (fields : BerValue list) (tag : int) : byte arr
 /// Optional integer under a context tag.
 let private integerAtOpt (fields : BerValue list) (tag : int) : int option =
     match contextAt fields tag with
-    | Some v -> Some (asInteger v)
+    | Some v -> asInteger v
     | None -> None
 
 
@@ -407,7 +487,7 @@ let private encodeEncPartBytes (epFields : BerValue list) : byte array =
 
 ///
 /// Encode a Ticket SEQUENCE back to wire format.
-let private encodeTicketFromFields (ticketFields : BerValue list) : byte array =
+let private encodeTicketFromFields (ticketFields : BerValue list) : byte array option =
     let tktVno = integerAtOr ticketFields 0 5
     let realmStr = generalStringAtOrEmpty ticketFields 1
     let snameVal = defaultArg (contextAt ticketFields 2) (BerSequence [])
@@ -416,46 +496,45 @@ let private encodeTicketFromFields (ticketFields : BerValue list) : byte array =
         match snameVal with
         | BerSequence snFields -> extractSnameParts snFields
         | _ -> Encoding.encodePrincipalName 1 [| "" |]
-    let encPartBytes =
-        match encPartVal with
-        | BerSequence epFields -> encodeEncPartBytes epFields
-        | _ -> invalidArg "value" "enc-part is not a sequence"
-    Encoding.encodeTicket tktVno (Encoding.encodeRealm realmStr) snameParts encPartBytes
+    match encPartVal with
+    | BerSequence epFields ->
+        Encoding.encodeTicket tktVno (Encoding.encodeRealm realmStr) snameParts (encodeEncPartBytes epFields) |> Some
+    | _ -> None
 
 
 ///
 /// Extract the raw ticket bytes from KDC-REP.
 /// Re-encodes the ticket from parsed BER values back to wire format.
 /// 
-let extractTicketBytes (rep : BerValue) : byte array =
+let extractTicketBytes (rep : BerValue) : byte array option =
     match rep with
     | BerSequence fields ->
         match extractTicketValue fields with
         | BerSequence ticketFields -> encodeTicketFromFields ticketFields
-        | _ -> invalidArg "value" "Unexpected ticket format"
-    | _ -> invalidArg "value" "Not a KDC-REP"
+        | _ -> None
+    | _ -> None
 
 
 ///
 /// KDC-REP: [0] pvno, [1] msg-type, [2] padata (opt), [3] crealm,
 /// [4] cname, [5] ticket, [6] enc-part
 /// 
-let extractEncPart (rep : BerValue) : BerValue =
+let extractEncPart (rep : BerValue) : BerValue option =
     match rep with
-    | BerSequence fields -> defaultArg (contextAt fields 6) (BerSequence [])
-    | _ -> invalidArg "value" "Not a KDC-REP"
+    | BerSequence fields -> contextAt fields 6
+    | _ -> None
 
 
-let extractEncPartCipher (rep : BerValue) : byte array =
+let extractEncPartCipher (rep : BerValue) : byte array option =
     match extractEncPart rep with
-    | BerSequence fields -> octetStringAtOrEmpty fields 2
-    | _ -> invalidArg "value" "enc-part is not a sequence"
+    | Some (BerSequence fields) -> Some (octetStringAtOrEmpty fields 2)
+    | _ -> None
 
 
-let extractEncPartEtype (rep : BerValue) : int =
+let extractEncPartEtype (rep : BerValue) : int option =
     match extractEncPart rep with
-    | BerSequence fields -> integerAtOr fields 0 18
-    | _ -> invalidArg "value" "enc-part is not a sequence"
+    | Some (BerSequence fields) -> Some (integerAtOr fields 0 18)
+    | _ -> None
 
 
 let extractCname (rep : BerValue) : BerValue option =
@@ -477,9 +556,7 @@ let extractCrealm (rep : BerValue) : string option =
 /// Try to parse an e-data field into a PA-DATA sequence.
 let private tryParsePaDataSequence (v : BerValue) : BerValue list =
     match v with
-    | BerOctetString b ->
-        try parseBer b |> asSequence
-        with _ -> []
+    | BerOctetString b -> defaultArg (asSequence (parseBer b)) []
     | BerSequence items -> items
     | _ -> []
 
@@ -507,12 +584,9 @@ let private extractGeneralizedTimeValue (v : BerValue) : DateTime option =
 ///
 /// Extract stime [4] from KRB-ERROR for clock skew correction
 let extractStimeFromKrbError (data : byte array) : DateTime option =
-    try
-        match parseBer data with
-        | BerSequence fields ->
-            match contextAt fields 4 with
-            | None -> None
-            | Some v -> extractGeneralizedTimeValue v
-        | _ -> None
-    with _ ->
-        None
+    match parseBer data with
+    | BerSequence fields ->
+        match contextAt fields 4 with
+        | None -> None
+        | Some v -> extractGeneralizedTimeValue v
+    | _ -> None

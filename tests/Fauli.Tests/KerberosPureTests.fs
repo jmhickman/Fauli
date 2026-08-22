@@ -98,7 +98,7 @@ let ``buildApReq produces APPLICATION 14 with encrypted authenticator`` () =
     | BerSequence fields ->
         match contextAt fields 4 with
         | Some (BerSequence encFields) ->
-            let cipherBytes = contextAt encFields 2 |> Option.map asOctetString
+            let cipherBytes = contextAt encFields 2 |> Option.bind asOctetString
             Assert.True(cipherBytes.IsSome, "AP-REQ should have encrypted authenticator cipher")
             Assert.True(cipherBytes.Value.Length > 16, "cipher should include confounder+payload+MAC")
         | Some _ -> Assert.Fail "Authenticator should be EncryptedData SEQUENCE"

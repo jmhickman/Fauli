@@ -47,7 +47,7 @@ let private generalStringAt (items : BerValue list) (tag : int) : string option 
 /// Integer under a context tag, or a default when missing.
 let private integerAtOr (items : BerValue list) (tag : int) (defaultValue : int) : int =
     match contextAt items tag with
-    | Some v -> asInteger v
+    | Some v -> defaultArg (asInteger v) defaultValue
     | None -> defaultValue
 
 
@@ -55,7 +55,7 @@ let private integerAtOr (items : BerValue list) (tag : int) (defaultValue : int)
 /// OCTET STRING under a context tag, or empty when missing.
 let private octetStringAtOrEmpty (items : BerValue list) (tag : int) : byte array =
     match contextAt items tag with
-    | Some v -> asOctetString v
+    | Some v -> defaultArg (asOctetString v) [||]
     | None -> [||]
 
 
@@ -143,7 +143,7 @@ let private parseKrbCredInfo (items : BerValue list) : KirbiCredInfo option =
         | Some sn -> parsePrincipalName sn
     let endtime =
         match contextAt items 6 with
-        | Some v -> Some (asGeneralizedTime v)
+        | Some v -> asGeneralizedTime v
         | None -> None
     Some
         { sessionKey = sessionKeyFromCredInfo items
