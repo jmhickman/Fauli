@@ -15,7 +15,7 @@ let spnPrefixFor (connectionType : ConnectionType) : SpnPrefix =
     | WinRM -> SpnHttp
     | HTTP -> SpnHttp
     | MSSql -> SpnMssqlSvc
-    | RPC -> SpnE351
+    | RPC -> SpnHost
     | _ -> SpnOther ""
 
 
@@ -27,7 +27,7 @@ let private prefixToString (prefix : SpnPrefix) : string =
     | SpnLdap -> "ldap"
     | SpnHttp -> "http"
     | SpnMssqlSvc -> "MSSQLSvc"
-    | SpnE351 -> "E351"
+    | SpnHost -> "HOST"
     | SpnOther s -> s
 
 
@@ -165,7 +165,6 @@ let private realmFromDomainName (DomainName domain) : Result<KerberosRealm, Auth
 /// Single-label non-IP host as a realm candidate (lab short names).
 let private realmFromSingleLabelHost (hostStr : string) : Result<KerberosRealm, AuthError> =
     match hostLooksLikeIp hostStr with
-    | true -> KerberosRealmUnreachable |> Error
     | false when not (String.IsNullOrWhiteSpace hostStr) && not (hostStr.Contains('.')) ->
         KerberosRealm.create hostStr
     | _ -> KerberosRealmUnreachable |> Error
@@ -204,5 +203,4 @@ let resolveRealmFromTgtCrealm (crealm : string option) (host : Host) : Result<Ke
     match crealm with
     | Some realm when not (String.IsNullOrWhiteSpace realm) ->
         KerberosRealm.create realm
-    | _ ->
-        deriveRealm host
+    | _ -> deriveRealm host

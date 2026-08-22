@@ -55,7 +55,7 @@ type internal SpnPrefix =
     | SpnLdap
     | SpnHttp
     | SpnMssqlSvc
-    | SpnE351
+    | SpnHost
     | SpnOther of string
 
 
