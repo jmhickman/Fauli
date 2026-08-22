@@ -19,6 +19,18 @@ type Dialect =
 
 
 ///
+/// How the last AES-CMAC block is finished ([RFC 4493] §2.4 / [MS-SMB2] §3.1.4.2).
+type private LastBlockKind =
+    | CompleteLastBlock
+    | PaddedLastBlock
+
+
+type private CmacLayout =
+    { prefixCount : int
+      lastKind : LastBlockKind }
+
+
+///
 /// Derive output bytes using NIST SP 800-108 KDF in Counter Mode.
 /// Used by SMB3 to derive signing, encryption, and application keys from the session key.
 ///
@@ -43,100 +55,125 @@ let internal kdfCounterMode (ki : byte array) (label : byte array) (context : by
 
 
 ///
-/// Generate subkeys K1, K2 from the base key per RFC 4493 §2.1.
-let internal generateSubkeys (key : byte array) : byte array * byte array =
+/// AES-CMAC block width (RFC 4493).
+let private blockSize = 16
+
+
+///
+/// Rb for 128-bit CMAC: 0x87 in the last octet ([RFC 4493] §2.3).
+let private xorConstRb (block : byte array) : byte array =
+    Array.mapi (fun offset b ->
+        match offset = blockSize - 1 with
+        | true -> byte (int b ^^^ 0x87)
+        | false -> b) block
+
+
+///
+/// Carry into `offset` is the former MSB of the next octet (0 at the last octet).
+let private nextBitCarry (block : byte array) (offset : int) : int =
+    match offset + 1 < blockSize with
+    | true -> int block.[offset + 1] >>> 7
+    | false -> 0
+
+
+///
+/// One-bit left shift of a 16-octet block, MSB discarded, zeros shifted in from the right.
+let private leftShiftOneBit (block : byte array) : byte array =
+    Array.init blockSize (fun offset ->
+        byte (int block.[offset] <<< 1 &&& 0xFF ||| nextBitCarry block offset))
+
+
+///
+/// RFC 4493 dbl: L << 1, xor Rb when the original MSB was set.
+let private doubleBlock (block : byte array) : byte array =
+    match block.[0] &&& 0x80uy <> 0uy with
+    | false -> leftShiftOneBit block
+    | true -> block |> leftShiftOneBit |> xorConstRb
+
+
+///
+/// AES-128-ECB of one 16-octet block (no padding).
+let private encryptBlock (key : byte array) (block : byte array) : byte array =
     use aes = Aes.Create()
     aes.Key <- key
     aes.Mode <- CipherMode.ECB
     aes.Padding <- PaddingMode.None
-    let l = aes.CreateEncryptor().TransformFinalBlock(Array.zeroCreate<byte> 16, 0, 16)
-    let lHigh = BitConverter.ToUInt64(l |> Array.take 8 |> Array.rev, 0)
-    let lLow  = BitConverter.ToUInt64(l |> Array.skip 8 |> Array.rev, 0)
-    let k1High = lHigh <<< 1 ||| (lLow >>> 63) &&& 0xFFFFFFFFFFFFFFFFUL
-    let k1Low  = lLow  <<< 1 &&& 0xFFFFFFFFFFFFFFFFUL
-    let k1 = Array.concat [BitConverter.GetBytes k1High |> Array.rev; BitConverter.GetBytes(k1Low) |> Array.rev]
-    if lHigh >>> 63 &&& 1UL <> 0UL then
-        k1.[15] <- byte (int k1.[15] ^^^ 0x87)
-    let k1High' = BitConverter.ToUInt64(k1 |> Array.take 8 |> Array.rev, 0)
-    let k1Low'  = BitConverter.ToUInt64(k1 |> Array.skip 8 |> Array.rev, 0)
-    let k2High = k1High' <<< 1 ||| (k1Low' >>> 63) &&& 0xFFFFFFFFFFFFFFFFUL
-    let k2Low  = k1Low'  <<< 1 &&& 0xFFFFFFFFFFFFFFFFUL
-    let k2 = Array.concat [BitConverter.GetBytes k2High |> Array.rev; BitConverter.GetBytes(k2Low) |> Array.rev]
-    if k1High' >>> 63 &&& 1UL <> 0UL then
-        k2.[15] <- byte (int k2.[15] ^^^ 0x87)
-    k1, k2
+    aes.CreateEncryptor().TransformFinalBlock(block, 0, blockSize)
+
+
+///
+/// AES-128(K, 0^128) — the L value in [RFC 4493] §2.3.
+let private encryptZeroBlock (key : byte array) : byte array =
+    encryptBlock key (Array.zeroCreate blockSize)
+
+
+///
+/// Generate subkeys K1, K2 from the base key per RFC 4493 §2.3.
+let internal generateSubkeys (key : byte array) : byte array * byte array =
+    let k1 = doubleBlock (encryptZeroBlock key)
+    k1, doubleBlock k1
 
 
 ///
 /// Pad a partial last block for AES-CMAC: append 0x80 then zero-fill to 16 bytes.
 /// Handles empty data (zero-length block) correctly per RFC 4493.
-/// 
 let private padBlock (data : byte array) : byte array =
-    let padded = Array.zeroCreate<byte> 16
-    if data.Length > 0 then
-        Array.Copy(data, 0, padded, 0, data.Length)
-    if data.Length < 16 then
-        padded.[data.Length] <- 0x80uy
-    padded
+    Array.init blockSize (fun i ->
+        match i < data.Length, i = data.Length with
+        | true, _ -> data.[i]
+        | false, true -> 0x80uy
+        | false, false -> 0uy)
 
 
 ///
 /// XOR two 16-byte blocks.
 let private xor128 (a : byte array) (b : byte array) : byte array =
-    Array.init 16 (fun i -> byte (int a.[i] ^^^ int b.[i]))
+    Array.init blockSize (fun i -> byte (int a.[i] ^^^ int b.[i]))
 
 
 ///
-/// Compute AES-CMAC over the message using the given 128-bit key.
-/// Returns the full 16-byte MAC per RFC 4493 §3.
+/// n = ceil(len/16) except empty → one padded block; full last block uses K1.
+let private cmacLayout (message : byte array) : CmacLayout =
+    match message.Length with
+    | 0 -> { prefixCount = 0; lastKind = PaddedLastBlock }
+    | n when n % blockSize = 0 -> { prefixCount = n / blockSize - 1; lastKind = CompleteLastBlock }
+    | n -> { prefixCount = n / blockSize; lastKind = PaddedLastBlock }
+
+
+let private sliceBlock (message : byte array) (index : int) : byte array =
+    Array.sub message (index * blockSize) blockSize
+
+
+let private lastRawBytes (message : byte array) (prefixCount : int) : byte array =
+    match message.Length - prefixCount * blockSize with
+    | rem when rem > 0 -> Array.sub message (prefixCount * blockSize) rem
+    | _ -> [||]
+
+
+let private finishLastBlock (k1 : byte array) (k2 : byte array) (message : byte array) (layout : CmacLayout) : byte array =
+    match layout.lastKind with
+    | CompleteLastBlock -> xor128 (sliceBlock message layout.prefixCount) k1
+    | PaddedLastBlock -> xor128 (padBlock (lastRawBytes message layout.prefixCount)) k2
+
+
+let private cbcEncrypt (key : byte array) (x : byte array) (block : byte array) : byte array =
+    xor128 x block |> encryptBlock key
+
+
+let private encryptPrefix (key : byte array) (message : byte array) (prefixCount : int) : byte array =
+    Array.init prefixCount (sliceBlock message)
+    |> Array.fold (cbcEncrypt key) (Array.zeroCreate blockSize)
+
+
 ///
-/// Compute AES-CMAC per [MS-SMB2] §3.1.4.2:
-///   1. n = len(M) // 16  (integer division, NOT ceiling)
-///   2. If n == 0: n = 1, flag = False (pad empty message with K2)
-///   3. If len(M) % 16 == 0: flag = True (full last block, use K1)
-///   4. Otherwise: n += 1, flag = False (partial last block, pad with K2)
-/// 
+/// AES-CMAC over the message ([RFC 4493] §2.4, [MS-SMB2] §3.1.4.2).
+/// Empty or partial last block is padded and mixed with K2; a full last block uses K1.
 let internal aesCmac (key : byte array) (message : byte array) : byte array =
-    let blockSize = 16
-    let zeros = Array.zeroCreate<byte> 16
     let k1, k2 = generateSubkeys key
-    let n = message.Length / blockSize
-    let flag, n =
-        if n = 0 then
-            false, 1  // empty message: treat as 1 padded block
-        elif message.Length % blockSize = 0 then
-            true, n   // full last block
-        else
-            false, n + 1  // partial last block: increment n
-    let mutable x = zeros
-    for i in 0 .. n - 2 do
-        let blockStart = i * blockSize
-        let block = Array.zeroCreate<byte> blockSize
-        Array.Copy(message, blockStart, block, 0, blockSize)
-        let y = xor128 x block
-        use aes = Aes.Create()
-        aes.Key <- key
-        aes.Mode <- CipherMode.ECB
-        aes.Padding <- PaddingMode.None
-        x <- aes.CreateEncryptor().TransformFinalBlock(y, 0, blockSize)
-    let lastBlockStart = (n - 1) * blockSize
-    let lastBlock =
-        if flag then
-            let m_n = Array.zeroCreate<byte> blockSize
-            Array.Copy(message, lastBlockStart, m_n, 0, blockSize)
-            xor128 m_n k1
-        else
-            let remaining = message.Length - lastBlockStart
-            let rawBlock = Array.zeroCreate<byte> remaining
-            if remaining > 0 then
-                Array.Copy(message, lastBlockStart, rawBlock, 0, remaining)
-            xor128 (padBlock rawBlock) k2
-    let y = xor128 lastBlock x
-    use aes = Aes.Create()
-    aes.Key <- key
-    aes.Mode <- CipherMode.ECB
-    aes.Padding <- PaddingMode.None
-    aes.CreateEncryptor().TransformFinalBlock(y, 0, blockSize)
+    let layout = cmacLayout message
+    finishLastBlock k1 k2 message layout
+    |> xor128 (encryptPrefix key message layout.prefixCount)
+    |> encryptBlock key
 
 
 ///
@@ -162,6 +199,7 @@ let deriveSigningKey
             match dialect with
             | SMB311 -> Array.append (Encoding.ASCII.GetBytes "SMBSigningKey") [| 0uy |]
             | _ -> Array.append (Encoding.ASCII.GetBytes "SMB2AESCMAC") [| 0uy |]
+        
         let context =
             match dialect with
             | SMB311 ->
@@ -169,6 +207,7 @@ let deriveSigningKey
                 | Some h -> h
                 | None -> Array.zeroCreate<byte> 64
             | _ -> Array.append (Encoding.ASCII.GetBytes "SmbSign") [| 0uy |]
+        
         let ki =
             if sessionKey.Length >= 16 then Array.sub sessionKey 0 16
             else sessionKey
@@ -214,7 +253,14 @@ let signMessage (dialect : Dialect) (sessionKey : byte array) (signingKey : byte
     let signature = computeSignature dialect sessionKey signingKey prepared
     let signed = Array.copy prepared
     Array.Copy(signature, 0, signed, 48, 16)
+    
     signed
+
+
+///
+/// Constant-time 16-byte compare (always visits every octet).
+let private signaturesMatch (extracted : byte array) (expected : byte array) : bool =
+    Array.fold2 (fun acc x y -> acc ||| int x ^^^ int y) 0 extracted expected = 0
 
 
 ///
@@ -223,17 +269,14 @@ let signMessage (dialect : Dialect) (sessionKey : byte array) (signingKey : byte
 /// Extracts the signature from the header, clears both the signature field
 /// and the SMB2_FLAGS_SIGNED bit, recomputes the signature over the message,
 /// and performs a constant-time comparison.
-/// 
 let verifyMessageSignature (dialect : Dialect) (sessionKey : byte array) (signingKey : byte array option) (message : byte array) : bool =
     let extractedSignature = Array.sub message 48 16
     let verified = Array.copy message
     Array.Clear(verified, 48, 16)
     verified.[16] <- byte (int verified.[16] ||| 0x08)
-    let expectedSignature = computeSignature dialect sessionKey signingKey verified
-    let mutable diff = 0
-    for i in 0..15 do
-        diff <- diff ||| int extractedSignature.[i] ^^^ int expectedSignature.[i]
-    diff = 0
+    
+    computeSignature dialect sessionKey signingKey verified
+    |> signaturesMatch extractedSignature
 
 
 ///
