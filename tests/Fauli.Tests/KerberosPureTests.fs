@@ -146,16 +146,16 @@ let ``wrapSpnego wraps GSS token in SPNEGO negTokenInit`` () =
     Assert.True(spnego.Length > gssToken.Length)
 
 // ===========================================================================
-// 5. Full pure chain: buildSpnegoTokenFromTicket
+// 5. Full pure chain: AP-REQ inside SPNEGO
 // ===========================================================================
 
 [<Fact>]
-let ``buildSpnegoTokenFromTicket produces valid SPNEGO token`` () =
+let ``buildSpnegoToken of buildApReq produces valid SPNEGO token`` () =
     let key = makeTestKey ()
     let ticketBytes = Array.init 300 (fun i -> byte (i % 200))
     let cname = encodePrincipalName 1 [| "Administrator" |] |> parseBer
 
-    let spnego = buildSpnegoTokenFromTicket ticketBytes key "AD-LAB.LOCAL" cname
+    let spnego = buildSpnegoToken (buildApReq ticketBytes key "AD-LAB.LOCAL" cname)
 
     Assert.True(spnego.Length > 100)
     Assert.Equal(0x60uy, spnego.[0])  // AID tag (application [0] constructed)

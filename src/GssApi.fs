@@ -25,6 +25,7 @@ let private concatMany (arrays : byte array array) : byte array =
             Array.Copy(arrays.[idx], 0, result, offset, arrays.[idx].Length)
             copyLoop (idx + 1) (offset + arrays.[idx].Length)
     copyLoop 0 0
+    
     result
 
 
@@ -66,7 +67,7 @@ let private derOctetString (content : byte array) : byte array =
 let private rawOidValue (oidStr : string) : byte array =
     let oid = new Security.Cryptography.Oid(oidStr)
     let components = oid.Value.Split('.') |> Array.map int
-    let first = byte (components.[0] * 40 + components.[1])
+    
     let encodeValue (v : int) : byte array =
         let rec collect n acc =
             match n with
@@ -77,8 +78,9 @@ let private rawOidValue (oidStr : string) : byte array =
             match i < groups.Length - 1 with
             | true -> byte (0x80 ||| groups.[i])
             | false -> byte groups.[i])
-    let rest = components.[2..] |> Array.collect encodeValue
-    Array.concat [| [| first |]; rest |]
+
+    Array.concat [| [| byte (components.[0] * 40 + components.[1]) |]
+                    components.[2..] |> Array.collect encodeValue |]
 
 
 ///
@@ -135,6 +137,7 @@ let internal wrapNtlmSpnego (ntlmType1 : byte array) : byte array =
     let negInit = derTlv ctx0 (derSequence (concatMany [| mechTypes; mechToken |]))
     let spnegoOidTlv = concatMany [| derTag 0 false 6; derLength spnegoOid.Length; spnegoOid |]
     let body = concatMany [| spnegoOidTlv; negInit |]
+    
     concat2 aidTag (concat2 (derLength body.Length) body)
 
 
@@ -190,24 +193,8 @@ let internal buildSpnegoToken (apReq : byte array) : byte array =
     let negTokenInitPayload = derTlv ctx0Constructed (derSequence (concatMany [| mechTypeInner; mechToken |]))
     let spnegoOidTlv = concatMany [| derTag 0 false 6; derLength spnegoOid.Length; spnegoOid |]
     let gssApiHeader = concatMany [| spnegoOidTlv; negTokenInitPayload |]
+    
     concat2 aidTag (concat2 (derLength gssApiHeader.Length) gssApiHeader)
-
-
-///
-/// Build a complete SPNEGO-wrapped authentication token from service ticket material.
-/// This is the primary function protocol handlers will use.
-/// 
-let internal buildSpnegoTokenFromTicket (ticketBytes : byte array) (sessionKey : Key) (crealm : string) (cname : BerValue) : byte array =
-    buildSpnegoToken (buildApReq ticketBytes sessionKey crealm cname)
-
-
-///
-/// Build a complete SPNEGO-wrapped authentication token with GSS-API channel bindings.
-/// Use this when the protocol requires RFC 4121 channel binding (e.g., some LDAP/SMB scenarios).
-/// Channel binding is always included for modern AD domains.
-/// 
-let internal buildSpnegoTokenWithChannelBindings (ticketBytes : byte array) (sessionKey : Key) (crealm : string) (cname : BerValue) (_flags : int) : byte array =
-    buildSpnegoToken (buildApReq ticketBytes sessionKey crealm cname)
 
 
 ///
@@ -244,6 +231,7 @@ let private readDerLengthAt (data : byte array) (offset : int) : (int * int) opt
     | true ->
         let lenByte = data.[offset]
         let num = int (lenByte &&& 0x7Fuy)
+        
         match lenByte &&& 0x80uy = 0uy, num > 0 && num <= 4 && offset + 1 + num <= data.Length with
         | true, _ ->
             Some (offset + 1, int lenByte)
@@ -263,18 +251,6 @@ let private readTlvAt (data : byte array) (pos : int) : (byte * byte array * int
         Some (data.[pos], Array.sub data contentStart contentLen, contentStart + contentLen)
     | _ ->
         None
-
-
-///
-/// Walk consecutive TLVs in a SEQUENCE body → `(tag, content)` list.
-/// Total: stops cleanly at first undecodable TLV (no exceptions).
-/// 
-let private parseDerSequenceFields (data : byte array) : (byte * byte array) list =
-    let rec loop pos acc =
-        match readTlvAt data pos with
-        | None -> List.rev acc
-        | Some (tag, value, next) -> loop next ((tag, value) :: acc)
-    loop 0 []
 
 
 ///
@@ -402,37 +378,6 @@ let internal parseSnegoNegTokenResp (data : byte array) : SnegoState * byte arra
 
 
 ///
-/// Detect whether raw bytes look like a SPNEGO-wrapped token (outer SEQUENCE + SPNEGO OID marker).
-let internal isSnegoToken (data : byte array) : bool =
-    match data.Length > 5 with
-    | false -> false
-    | true ->
-        data.[0] = berSequence
-        && Array.exists (fun b -> b = 0x2Buy) data
-
-
-///
-/// Extract the inner GSS-API mechToken from a SPNEGO NegTokenInit.
-/// Total: malformed input → None (no exceptions).
-/// 
-let internal extractGssTokenFromSnego (data : byte array) : byte array option =
-    match data.Length >= 2 && data.[0] = berSequence with
-    | false -> None
-    | true ->
-        match readDerLengthAt data 1 with
-        | None -> None
-        | Some (contentStart, contentLen) when contentStart + contentLen > data.Length -> None
-        | Some (contentStart, contentLen) ->
-            Array.sub data contentStart contentLen
-            |> parseDerSequenceFields
-            |> List.choose (fun (tag, value) ->
-                match tag = berOctetString with
-                | true -> Some value
-                | false -> None)
-            |> List.tryLast
-
-
-///
 /// Extract the raw responseToken bytes from a (possibly already parsed) negTokenResp mechToken.
 /// The value passed here is usually the inner of the [2] context (the OCTET STRING value after tag+len).
 /// 
@@ -473,20 +418,17 @@ let private findApRepByScan (gssToken : byte array) : byte array option =
 
 
 let internal stripGssApRepWrapper (gssToken : byte array) : byte array option =
-    try
-        match gssToken.Length < 2 with
-        | true -> None
-        | false ->
-            match gssToken.[0] with
-            | 0x6Fuy -> Some gssToken  // APPLICATION 15 = AP-REP
-            | 0x30uy -> Some gssToken  // SEQUENCE
-            | 0x60uy ->
-                match findApRepOffsetAfterOid gssToken with
-                | Some i -> Some (sliceFromIndex gssToken i)
-                | None -> None
-            | _ -> findApRepByScan gssToken
-    with _ ->
-        Some gssToken
+    match gssToken.Length < 2 with
+    | true -> None
+    | false ->
+        match gssToken.[0] with
+        | 0x6Fuy -> Some gssToken  // APPLICATION 15 = AP-REP
+        | 0x30uy -> Some gssToken  // SEQUENCE
+        | 0x60uy ->
+            match findApRepOffsetAfterOid gssToken with
+            | Some i -> Some (sliceFromIndex gssToken i)
+            | None -> None
+        | _ -> findApRepByScan gssToken
 
 
 ///
@@ -505,13 +447,10 @@ let private apRepFromMechToken (mt : byte array) : byte array option =
 /// extract the inner AP_REP token bytes.
 /// 
 let internal extractApRepToken (blob : byte array) : byte array option =
-    try
-        let _, mechTokenOpt = parseSnegoNegTokenResp blob
-        match mechTokenOpt with
-        | None -> None
-        | Some mt -> apRepFromMechToken mt
-    with _ ->
-        None
+    let _, mechTokenOpt = parseSnegoNegTokenResp blob
+    match mechTokenOpt with
+    | None -> None
+    | Some mt -> apRepFromMechToken mt
 
 
 ///
@@ -563,12 +502,9 @@ let private apRepEncPart (apRep : BerValue) : BerValue option =
 ///
 /// Locate EncryptedData.cipher (+ etype) inside raw AP-REP bytes via structure.
 let private locateApRepCipher (apRepBytes : byte array) : (int * byte array) option =
-    try
-        match apRepEncPart (parseBer apRepBytes) with
-        | None -> None
-        | Some encPart -> encryptedDataEtypeAndCipher encPart
-    with _ ->
-        None
+    match apRepEncPart (parseBer apRepBytes) with
+    | None -> None
+    | Some encPart -> encryptedDataEtypeAndCipher encPart
 
 
 ///
@@ -596,8 +532,7 @@ let private subkeyFromEncApRepPart (part : BerValue) : byte array option =
 ///
 /// Extract optional subkey from decrypted EncAPRepPart plaintext.
 let private findSubkeyInPlaintext (plain : byte array) : byte array option =
-    try subkeyFromEncApRepPart (parseBer plain)
-    with _ -> None
+    subkeyFromEncApRepPart (parseBer plain)
 
 
 ///
@@ -640,16 +575,16 @@ let private acceptSubkey (sk : byte array) : byte array option =
     | false -> None
 
 
+let private decryptWithTicketKey (keyBytes : byte array) (etype : int, cipher : byte array) : byte array option =
+    tryDecryptEncApRepPart keyBytes etype cipher
+
+
 let private extractSubkeyFromApRep (apRepBytes : byte array) (keyBytes : byte array) : byte array option =
-    match locateApRepCipher apRepBytes with
-    | None -> None
-    | Some (etype, cipher) ->
-        match tryDecryptEncApRepPart keyBytes etype cipher with
-        | None -> None
-        | Some plain ->
-            match findSubkeyInPlaintext plain with
-            | None -> None
-            | Some sk -> acceptSubkey sk
+    apRepBytes
+    |> locateApRepCipher
+    |> Option.bind (decryptWithTicketKey keyBytes)
+    |> Option.bind findSubkeyInPlaintext
+    |> Option.bind acceptSubkey
 
 
 let private establishSmbGssKey (keyBytes : byte array) (outcome : GssNegotiationOutcome) : SmbGssKeyEstablishment =
