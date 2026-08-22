@@ -259,19 +259,11 @@ let private continueAfterParams (request : AuthenticationRequest) (paramsResult 
 
 ///
 /// <summary>
-/// Public entry point for Fauli. Given an <see cref="T:Fauli.Domain.AuthenticationRequest"/>,
+/// Public entry point. Given an <see cref="T:Fauli.Domain.AuthenticationRequest"/>,
 /// selects a viable authentication method, obtains the necessary auth material, opens an
 /// authenticated connection to the target service, and returns an
 /// <see cref="T:Fauli.Domain.AuthenticatedResponse"/> (or an <see cref="T:Fauli.Domain.AuthError"/>).
 /// </summary>
-///
-/// <remarks>
-/// <para><b>Pipeline</b></para>
-/// <list type="number">
-///   <item>Intersect credential methods with protocol methods (priority order).</item>
-///   <item>Try each method until one produces handler params (first success wins).</item>
-///   <item>Dispatch to the protocol handler for <c>connectionType</c> using <c>connectHost</c>.</item>
-/// </list>
 ///
 /// <para><b>Request fields</b></para>
 /// <list type="table">
