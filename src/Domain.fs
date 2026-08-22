@@ -191,36 +191,22 @@ type SmbEncryption =
       DecryptionKey : byte array }
 
 
+///
+/// <summary>
+/// An authenticated SMB connection to a hosting server. Fauli handles negotiating
+/// the highest dialect available between the two hosts. SMB1 is not supported.
+/// <remarks> 
+/// When SmbEncryption is Some, the connection is SMB3 and all messages must be encrypted.
+/// </remarks>
+/// </summary>
+///
 type SmbSession =
-    { ///
-      /// The underlying bidirectional TCP stream for SMB2 messages.
-      Stream : NetworkStream
-      ///
-      /// The opaque SessionId assigned by the server. Must be included
-      /// in the SMB2 header of every message sent after session setup.
-      /// 
+    { Stream : NetworkStream
       SessionId : uint64
-      ///
-      /// The SMB2 dialect that was successfully negotiated (e.g. 0x0202, 0x0210).
-      /// Callers may need this to construct compatible requests.
-      /// 
       Dialect : uint16
-      ///
-      /// Session key for SMB2.x signing (HMAC-SHA256) / SMB3.x KDF input.
-      /// Kerberos: ticket session key (often truncated to 16 for signing).
-      /// NTLM: exported session key from NetNTLMv2.
-      /// 
       SessionKey : byte array
-      ///
-      /// Derived signing key (Some for SMB3.x with signing, None for SMB2.x).
       SigningKey : byte array option
-      ///
-      /// When Some, all post-setup messages must be SMB3-encrypted (TRANSFORM_HEADER).
       Encryption : SmbEncryption option
-      ///
-      /// Next SMB2 MessageId to use (negotiate=0 consumed; Kerberos SS uses 1 → next=2;
-      /// NTLM SS uses 1+2 → next=3). Callers must increment after each send.
-      /// 
       NextMessageId : uint64 }
 
 
@@ -246,45 +232,28 @@ let internal smbDialectCode (d : SmbDialect) : uint16 =
 
 
 ///
+/// <summary>
 /// An authenticated and bound LDAP session resulting from a successful SASL bind.
 ///
-/// This represents the state immediately after a BindResponse with
-/// resultCode = success (0) has been received and consumed.
-///
-/// No further LDAP operations (SearchRequest, ModifyRequest, etc.) have been issued yet.
+/// This represents the state immediately after a BindResponse.
 ///
 /// The caller receives this handle and is responsible for:
 /// - All subsequent LDAP protocol operations
-/// - Proper message ID management starting from NextMessageId
-/// - Reading and correlating responses
-/// - Handling controls, referrals, timeouts, etc.
 /// - Disposing the stream when done
-///
-/// Fauli's responsibility ends once the bind succeeds and this session
-/// is handed off. The caller "owns" the connection from this point.
+/// </summary>
 /// 
 type LdapSession =
-    { ///
-      /// The underlying bidirectional stream for LDAP BER messages (plain TCP or TLS).
-      /// The bind response has already been read from this stream.
-      /// 
-      Stream : Stream
-      ///
-      /// The message ID the caller must use for the first operation after the bind.
-      /// Fauli uses message ID 1 for the SASL bind request.
-      /// 
+    { Stream : Stream
       NextMessageId : int
-      ///
-      /// The identity (if any) that the directory server accepted as the bound entity.
-      /// This is typically the matchedDN from the successful BindResponse.
-      /// May be None for certain SASL mechanisms or server configurations.
-      /// 
       BoundAs : string option }
 
 
 ///
-/// Authenticated connection handle returned by the protocol handler.
-/// Each case corresponds to a ConnectionType and uses the underlying .NET type directly.
+/// <summary>
+/// Authenticated connection handle. Each type is configured as ready-to-use 
+/// by the caller. The caller is responsible for the disposal of the underlying
+/// resources.
+/// </summary>
 /// 
 type ConnectionHandle =
     | AuthSmb of SmbSession
@@ -482,7 +451,7 @@ module SAMLCredential =
 
 
 ///
-/// Unified credential type for the solver. Includes NoCredential for anonymous/implicit auth.
+/// Unified credential type
 type Credential =
     | UserPassword of UserNamePassword
     | KerberosKirbi of Kirbi
@@ -495,29 +464,33 @@ type Credential =
 
 
 ///
-/// Input to the solver: connection needed, credentials available, and hosts involved.
+/// <summary>Describes authentication requirements
 ///
-/// Three distinct host roles are modelled explicitly so that TCP connect target,
-/// Kerberos KDC address, and SPN principal can diverge (e.g. connect to IP while
-/// requesting a ticket for an FQDN SPN).
+/// Consumed by <see cref="F:Fauli.Solver.authenticate"/> to perform
+/// authentication and get back an <see cref="T:Fauli.Domain.AuthenticatedResponse"/>.
+///
+/// The chosen method of authentication is strongly influenced by how the TCP connect 
+/// target, the Kerberos KDC host, and the SPN principal are specified (IP or DNS).
+///
+/// <list type="bullet">
+/// <item><term>connectionType</term><description>The protocol to authenticate (SMB, LDAP, WinRM, …).</description></item>
+/// <item><term>credential</term><description>The credential to use — username/password, a Kerberos ticket cache, a certificate, etc.</description></item>
+/// <item><term>kdcHost</term><description>KDC / domain-controller address for Kerberos AS/TGS exchanges. Ignored for non-Kerberos protocols.</description></item>
+/// <item><term>connectHost</term><description>TCP connect target for the application protocol (LDAP/SMB/…); the protocol handler connects to this host.</description></item>
+/// <item><term>spnHost</term><description>Hostname used to build the Kerberos SPN (<c>cifs/…</c>, <c>ldap/…</c>). Must be an FQDN when targeting Active Directory; bare IPs usually fail Kerberos SPN lookup. Required — callers must decide which name the KDC should see, even if it happens to be the same as <c>connectHost</c>.</description></item>
+/// </list>
+/// </summary>
 /// 
 type AuthenticationRequest =
     { connectionType : ConnectionType
       credential : Credential
-      /// KDC / domain-controller address for Kerberos AS/TGS exchanges.
       kdcHost : Host
-      /// TCP connect target for the application protocol (LDAP/SMB/…).
-      /// The protocol handler connects to this host.
       connectHost : Host
-      /// Hostname used to build the Kerberos SPN (<c>cifs/…</c>, <c>ldap/…</c>).
-      /// Must be an FQDN when targeting Active Directory; bare IPs usually fail
-      /// Kerberos SPN lookup. This field is required — callers must decide which
-      /// name the KDC should see, even if it happens to be the same as <c>connectHost</c>.
       spnHost : Host }
 
 
 module AuthenticationRequest =
-    /// Create an authentication request with three distinct host roles.
+    /// Create an AuthenticationRequest
     let create (connectionType : ConnectionType) (credential : Credential) (kdcHost : Host) (connectHost : Host) (spnHost : Host) : AuthenticationRequest =
         { connectionType = connectionType
           credential = credential
@@ -563,12 +536,9 @@ type internal KerberosTicketParams =
 ///
 /// Parameters for NTLM protocol handler.
 type internal NtlmResponseParams =
-    { /// Optional prebuilt Type-3 (unused for SMB; SMB does NTLM on-connection).
-      authResponse : NtlmAuthResponse
+    { authResponse : NtlmAuthResponse
       userName : UserName
       domain : DomainName
-      /// Password required so protocol handlers can complete Type1→Type2→Type3
-      /// against the challenge delivered on the protocol connection (e.g. SMB).
       password : Password }
 
 
@@ -616,7 +586,12 @@ type SessionInfo =
 
 
 ///
-/// Response from the protocol handler after establishing an authenticated connection.
+/// <summary>
+/// A successful authentication attempt results in an AuthenticatedResponse, containing
+/// the ConnectionHandle, the method of authentication, and related SessionInfo for
+/// using or managing the existing connection 
+/// </summary>
+/// 
 type AuthenticatedResponse =
     { connection : ConnectionHandle
       authenticationMethod : AuthenticationMethod

@@ -135,11 +135,6 @@ let smbDialect311 : uint16 = 0x0311us
 
 
 ///
-/// SMB2 NEGOTIATE_SIGNING_ENABLED (bit 0).
-let smbNegotiateSigningEnabled : uint16 = 0x0001us
-
-
-///
 /// SMB2 protocol identifier: 0xFE + "SMB" (NetBIOS session).
 let smb2ProtocolId : byte array = [| 0xFEuy; 0x53uy; 0x4Duy; 0x42uy |]
 
