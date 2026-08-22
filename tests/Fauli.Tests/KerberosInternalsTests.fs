@@ -140,7 +140,14 @@ let ``encodePrincipalName and encodeRealm produce valid BER`` () =
 let ``encodeAuthenticator produces APPLICATION 2 structure`` () =
     let crealm = encodeRealm "TEST"
     let cname = encodePrincipalName 1 [| "user" |]
-    let auth = encodeAuthenticator crealm cname 12345 DateTime.UtcNow None (Some 42)
+    let auth =
+        encodeAuthenticator
+            { crealm = crealm
+              cname = cname
+              cksum = None
+              cusec = 12345
+              ctime = DateTime.UtcNow
+              seqNumber = Some 42 }
 
     let parsed = parseBer auth
     // Authenticator content is wrapped; just verify it parses to a non-trivial structure
@@ -154,7 +161,17 @@ let ``encodeKdcReqBody contains expected fields`` () =
     let realm = encodeRealm "EXAMPLE.COM"
     let sname = Some (encodePrincipalName 2 [| "cifs"; "server.example.com" |])
     let till = Some (DateTime.UtcNow.AddHours 10.0)
-    let body = encodeKdcReqBody options None realm sname till None 12345678 [| 18 |] None
+    let body =
+        encodeKdcReqBody
+            { kdcOptions = options
+              cname = None
+              realm = realm
+              sname = sname
+              till = till
+              rtime = None
+              nonce = 12345678
+              etype = [| 18 |]
+              additionalTickets = None }
 
     let parsed = parseBer body
     match parsed with

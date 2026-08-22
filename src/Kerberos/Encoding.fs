@@ -8,12 +8,7 @@ module internal Fauli.Kerberos.Encoding
 
 
 open System
-
-
 open System.Text
-
-
-open Fauli.Constants
 
 
 type TagClass =
@@ -28,10 +23,42 @@ type TagConstruction =
     | Constructed = 0x20uy  // bit 5 = 0x20 (32)
 
 
+///
+/// KDC-REQ-BODY fields ([RFC 4120] §5.4.1).
+type KdcReqBody =
+    { kdcOptions : byte array
+      cname : byte array option
+      realm : byte array
+      sname : byte array option
+      till : DateTime option
+      rtime : DateTime option
+      nonce : int
+      etype : int array
+      additionalTickets : byte array array option }
+
+
+type EncodeKdcReqBody = KdcReqBody -> byte array
+
+
+///
+/// Authenticator fields ([RFC 4120] §5.5.1).
+type Authenticator =
+    { crealm : byte array
+      cname : byte array
+      cksum : byte array option
+      cusec : int
+      ctime : DateTime
+      seqNumber : int option }
+
+
+type EncodeAuthenticator = Authenticator -> byte array
+
+
 let private concat2 (a : byte array) (b : byte array) : byte array =
     let result = Array.zeroCreate<byte> (a.Length + b.Length)
     Array.Copy(a, 0, result, 0, a.Length)
     Array.Copy(b, 0, result, a.Length, b.Length)
+    
     result
 
 
@@ -44,6 +71,7 @@ let private concatMany (arrays : byte array array) : byte array =
             Array.Copy(arrays.[idx], 0, result, offset, arrays.[idx].Length)
             copyLoop (idx + 1) (offset + arrays.[idx].Length)
     copyLoop 0 0
+    
     result
 
 
@@ -121,19 +149,18 @@ let encodeSequenceOf (childEncoder : 'a -> byte array) (items : 'a array) : byte
 ///
 /// Encode a BIT STRING with the given flag positions set.
 /// BER convention: bit 0 is the MSB of the first octet.
-/// Kerberos requires at least 32 bits (RFC 4120 §5.2.8).
 /// 
 let encodeBitString (flagPositions : int list) : byte array =
     let byteCount =
         match flagPositions with
         | [] -> 4
-        | flags -> max 4 ((List.max flags / 8) + 1)
+        | flags -> max 4 (List.max flags / 8 + 1)
     let bytes = Array.zeroCreate<byte> byteCount
     List.iter (fun pos ->
-        bytes.[pos / 8] <- bytes.[pos / 8] ||| byte (1 <<< (7 - (pos % 8)))) flagPositions
-    let content = concat2 [| 0x00uy |] bytes  // unused bits = 0
-    let tag = encodeTag TagClass.Universal TagConstruction.Primitive 3
-    encodeTlv tag content
+        bytes.[pos / 8] <- bytes.[pos / 8] ||| byte (1 <<< 7 - pos % 8)) flagPositions
+    
+    concat2 [| 0x00uy |] bytes  // unused bits = 0
+    |> encodeTlv (encodeTag TagClass.Universal TagConstruction.Primitive 3) 
 
 
 let encodeGeneralizedTime (dt : DateTime) : byte array =
@@ -195,15 +222,11 @@ let encodeChecksum (cksumtype : int) (checksum : byte array) : byte array =
 
 
 ///
-/// RFC 4121 §4.1.1 GSS-API checksum body used inside Authenticator.cksum
-/// (cksumtype 0x8003). Layout is little-endian:
-///   Lgth (uint32=16) || Bnd (16 octets) || Flags (uint32)
-/// 
+/// RFC 4121 §4.1.1 GSS-API checksum body
 let encodeGssApiChecksumBody (flags : uint32) : byte array =
-    let lgth = BitConverter.GetBytes 16u
-    let bnd = Array.zeroCreate<byte> 16
-    let flagsBytes = BitConverter.GetBytes flags
-    concatMany [| lgth; bnd; flagsBytes |]
+    concatMany [| BitConverter.GetBytes 16u
+                  Array.zeroCreate<byte> 16
+                  BitConverter.GetBytes flags |]
 
 
 let encodePaEncTsEnc (timestamp : DateTime) (usec : int option) : byte array =
@@ -259,26 +282,36 @@ let encodeApOptions (options : string list) : byte array =
     |> encodeBitString
 
 
+let private encodeTillField (till : DateTime) : byte array =
+    encodeContextConstructed 5 (encodeGeneralizedTime till)
+
+
+let private encodeRtimeField (rtime : DateTime) : byte array =
+    encodeContextConstructed 6 (encodeGeneralizedTime rtime)
+
+
+let private encodeAdditionalTicketsField (tickets : byte array array) : byte array =
+    encodeContextConstructed 11 (encodeSequence tickets)
+
+
 ///
-/// Encode KDC-REQ-BODY per RFC 4120:
+/// Encode KDC-REQ-BODY
 /// [0] kdc-options, [1] cname (opt), [2] realm, [3] sname (opt),
 /// [4] from (opt), [5] till (opt), [6] rtime (opt), [7] nonce,
 /// [8] etype, [9] addresses (opt), [10] enc-authorization-data (opt),
 /// [11] additional-tickets (opt)
 /// 
-let encodeKdcReqBody
-    kdcOptions cname realm sname till rtime nonce etype additionalTickets : byte array =
+let encodeKdcReqBody : EncodeKdcReqBody = fun body ->
     encodeSequence
-        [| encodeContextConstructed 0 kdcOptions
-           Option.defaultValue [||] (Option.map (fun c -> encodeContextConstructed 1 c) cname)
-           encodeContextConstructed 2 realm
-           Option.defaultValue [||] (Option.map (fun s -> encodeContextConstructed 3 s) sname)
-           encodeOptional (fun v -> encodeContextConstructed 5 (encodeGeneralizedTime v)) till
-           encodeOptional (fun v -> encodeContextConstructed 6 (encodeGeneralizedTime v)) rtime
-           encodeContextConstructed 7 (encodeInteger nonce)
-           encodeContextConstructed 8 (encodeSequenceOf encodeInteger etype)
-           Option.defaultValue [||] (Option.map (fun ticks ->
-               encodeContextConstructed 11 (encodeSequence ticks)) additionalTickets) |]
+        [| encodeContextConstructed 0 body.kdcOptions
+           encodeOptional (encodeContextConstructed 1) body.cname
+           encodeContextConstructed 2 body.realm
+           encodeOptional (encodeContextConstructed 3) body.sname
+           encodeOptional encodeTillField body.till
+           encodeOptional encodeRtimeField body.rtime
+           encodeContextConstructed 7 (encodeInteger body.nonce)
+           encodeContextConstructed 8 (encodeSequenceOf encodeInteger body.etype)
+           encodeOptional encodeAdditionalTicketsField body.additionalTickets |]
 
 
 ///
@@ -327,16 +360,23 @@ let encodeApReq apOptions ticket authenticator : byte array =
     encodeApplicationConstructed 14 content
 
 
+let private encodeCksumField (cksum : byte array) : byte array =
+    encodeContextConstructed 3 cksum
+
+
+let private encodeSeqNumberField (seqNumber : int) : byte array =
+    encodeContextConstructed 7 (encodeInteger seqNumber)
+
+
 ///
 /// Encode Authenticator: [APPLICATION 2]
-let encodeAuthenticator crealm cname cusec ctime cksum seqNumber : byte array =
+let encodeAuthenticator : EncodeAuthenticator = fun auth ->
     encodeApplicationConstructed 2
         (encodeSequence
             [| encodeContextConstructed 0 (encodeInteger 5)
-               encodeContextConstructed 1 crealm
-               encodeContextConstructed 2 cname
-               Option.defaultValue [||] (Option.map (fun cs -> encodeContextConstructed 3 cs) cksum)
-               encodeContextConstructed 4 (encodeInteger cusec)
-               encodeContextConstructed 5 (encodeGeneralizedTime ctime)
-               Option.defaultValue [||] (Option.map (fun v ->
-                   encodeContextConstructed 7 (encodeInteger v)) seqNumber) |])
+               encodeContextConstructed 1 auth.crealm
+               encodeContextConstructed 2 auth.cname
+               encodeOptional encodeCksumField auth.cksum
+               encodeContextConstructed 4 (encodeInteger auth.cusec)
+               encodeContextConstructed 5 (encodeGeneralizedTime auth.ctime)
+               encodeOptional encodeSeqNumberField auth.seqNumber |])

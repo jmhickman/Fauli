@@ -202,7 +202,17 @@ let private buildInitialAsReqWithParams (username : string) (realm : string) (no
     let till = now.AddHours 24.0 |> Some
     let rtime = now.AddHours 24.0 |> Some
     let etype = [| 18; 17; 23 |]
-    let reqBody = encodeKdcReqBody kdcOptions cname realmBytes sname till rtime nonce etype None
+    let reqBody =
+        encodeKdcReqBody
+            { kdcOptions = kdcOptions
+              cname = cname
+              realm = realmBytes
+              sname = sname
+              till = till
+              rtime = rtime
+              nonce = nonce
+              etype = etype
+              additionalTickets = None }
     let kdcReq = encodeKdcReq 10 (Some [| paPac |]) reqBody
     encodeAsReq kdcReq
 
@@ -242,7 +252,17 @@ let internal buildAsReqWithPreAuth (username : string) (realm : string) (key : K
     let till = now.AddHours 24.0 |> Some
     let rtime = now.AddHours 24.0 |> Some
     let etype = [| int key.enctype |]
-    let reqBody = encodeKdcReqBody kdcOptions cname realmBytes sname till rtime nonce etype None
+    let reqBody =
+        encodeKdcReqBody
+            { kdcOptions = kdcOptions
+              cname = cname
+              realm = realmBytes
+              sname = sname
+              till = till
+              rtime = rtime
+              nonce = nonce
+              etype = etype
+              additionalTickets = None }
     let kdcReq = encodeKdcReq 10 (Some [| paPac; paEncTs |]) reqBody
     encodeAsReq kdcReq
 
@@ -266,7 +286,17 @@ let internal buildPreauthAsReqForProver (username : string) (realm : string) (ke
     let till = now.AddHours 24.0 |> Some
     let rtime = now.AddHours 24.0 |> Some
     let etype = [| int key.enctype |]
-    let reqBody = encodeKdcReqBody kdcOptions cname realmBytes sname till rtime nonce etype None
+    let reqBody =
+        encodeKdcReqBody
+            { kdcOptions = kdcOptions
+              cname = cname
+              realm = realmBytes
+              sname = sname
+              till = till
+              rtime = rtime
+              nonce = nonce
+              etype = etype
+              additionalTickets = None }
     let kdcReq = encodeKdcReq 10 (Some [| paPac; paEncTs |]) reqBody
     encodeAsReq kdcReq
 
@@ -674,8 +704,14 @@ let internal buildTgsReq (tgtTicket : byte array) (sessionKey : Key) (spn : stri
         | [| service; rest |] -> [| service; rest |]
         | [| single |] -> [| single |]
         | parts -> parts
-    let authenticator = 
-        encodeAuthenticator (encodeRealm crealm) (encodeCnameBytes cname) (int (now.Ticks % 10000000L / 10L)) now None None     
+    let authenticator =
+        encodeAuthenticator
+            { crealm = encodeRealm crealm
+              cname = encodeCnameBytes cname
+              cksum = None
+              cusec = int (now.Ticks % 10000000L / 10L)
+              ctime = now
+              seqNumber = None } 
     let paTgs = 
         encrypt sessionKey KeyUsage.TgsReqAuth authenticator None
         |> encodeEncryptedData (int sessionKey.enctype) None 
@@ -686,7 +722,16 @@ let internal buildTgsReq (tgtTicket : byte array) (sessionKey : Key) (spn : stri
     let sname = encodePrincipalName nameSrvInst spnParts |> Some
     let till = now.AddHours 24.0 |> Some
     let etype = [| int sessionKey.enctype |]
-    encodeKdcReqBody kdcOptions None realmBytes sname till None nonce etype None
+    encodeKdcReqBody
+        { kdcOptions = kdcOptions
+          cname = None
+          realm = realmBytes
+          sname = sname
+          till = till
+          rtime = None
+          nonce = nonce
+          etype = etype
+          additionalTickets = None }
     |> encodeKdcReq 12 (Some [| paTgs |]) 
     |> encodeTgsReq 
 
@@ -989,7 +1034,13 @@ let private gssSmbChecksumFlags = 0x103Eu
 /// Build Authenticator for SMB without mutual auth.
 let private buildSmbAuthenticator (crealm : string) (cname : BerValue) (now : DateTime) : byte array =
     let cusec = int (now.Ticks % 10000000L / 10L)
-    encodeAuthenticator (encodeRealm crealm) (encodeCnameBytes cname) cusec now None None
+    encodeAuthenticator
+        { crealm = encodeRealm crealm
+          cname = encodeCnameBytes cname
+          cksum = None
+          cusec = cusec
+          ctime = now
+          seqNumber = None }
 
 
 ///
@@ -998,7 +1049,13 @@ let private buildSmbAuthenticatorMutual (crealm : string) (cname : BerValue) (no
     let cusec = int (now.Ticks % 10000000L / 10L)
     let cksumBody = encodeGssApiChecksumBody gssSmbChecksumFlags
     let cksum = encodeChecksum 0x8003 cksumBody
-    encodeAuthenticator (encodeRealm crealm) (encodeCnameBytes cname) cusec now (Some cksum) (Some 0)
+    encodeAuthenticator
+        { crealm = encodeRealm crealm
+          cname = encodeCnameBytes cname
+          cksum = Some cksum
+          cusec = cusec
+          ctime = now
+          seqNumber = Some 0 }
 
 
 ///
