@@ -33,10 +33,9 @@ module public KeyUsage =
     let ApRepEncPart = 12
 
 
-type public Key = {
-    enctype : EncryptionType
-    contents : byte array
-}
+type public Key = 
+    { enctype : EncryptionType
+      contents : byte array }
 
 
 let private concat2 (a : byte array) (b : byte array) : byte array =

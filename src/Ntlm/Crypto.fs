@@ -32,18 +32,13 @@ let private concatMany (arrays : byte array array) : byte array =
 
 
 ///
-/// Compute the NT-Hash (also called the NT hash or NTHash).
-/// This is the hash stored on Windows systems and used as the basis for all
-/// NetNTLMv2 computations.
-/// 
+/// Compute the NT-Hash.
 let internal computeNtHash (password : string) : byte array =
     md4 (Encoding.Unicode.GetBytes password)
 
 
 ///
-/// Compute the NTLMv2 response key (also called the NTLMv2 hash).
-/// This is derived from the NT-Hash and the user's identity.
-/// 
+/// Compute the NTLMv2 response key
 let internal computeNtlmV2Hash (ntHash : byte array) (username : string) (domain : string) : byte array =
     use hmac = new HMACMD5(ntHash)
     let identity =
@@ -60,22 +55,25 @@ let internal computeNtlmV2Hash (ntHash : byte array) (username : string) (domain
 /// 
 let private buildClientBlob (clientChallenge : byte array) (targetInfo : AvPair list) (serverTimestamp : DateTime option) : byte array =
     let sb = ResizeArray<byte>()
-    sb.Add 0x01uy  // RespType
-    sb.Add 0x01uy  // HiRespType
-    [1..6] |> List.iter (fun _ -> sb.Add 0x00uy)  // Reserved1+2
+    sb.Add 0x01uy 
+    sb.Add 0x01uy
+    
+    [1..6] |> List.iter (fun _ -> sb.Add 0x00uy)
     let timestamp =
         match serverTimestamp with
         | Some ts -> ts.ToFileTime()
         | None -> DateTime.UtcNow.ToFileTime()
     BitConverter.GetBytes timestamp |> Array.iter sb.Add
     clientChallenge |> Array.iter sb.Add
-    [1..4] |> List.iter (fun _ -> sb.Add 0x00uy)  // Reserved3
-    let micFlagValue = BitConverter.GetBytes(0x00000002u)  // LE
+    [1..4] |> List.iter (fun _ -> sb.Add 0x00uy)
+    
+    let micFlagValue = BitConverter.GetBytes 0x00000002u
     let withoutFlags =
         targetInfo
         |> List.filter (fun p -> p.avId <> AvId.MsvAvEOL && p.avId <> AvId.MsvAvFlags)
     let withMic =
         withoutFlags @ [ { avId = AvId.MsvAvFlags; value = micFlagValue } ]
+    
     encodeAvPairs withMic |> Array.iter sb.Add
     sb.ToArray()
 
@@ -106,13 +104,11 @@ let private computeLmV2Response (ntlmV2Hash : byte array) (serverChallenge : byt
 /// Derive the exported session key from the NTLMv2 hash and NTProofStr.
 let internal computeExportedSessionKey (ntlmV2Hash : byte array) (ntProofStr : byte array) : byte array = 
     use hmac = new HMACMD5(ntlmV2Hash)
-    hmac.ComputeHash(ntProofStr)
+    hmac.ComputeHash ntProofStr 
 
 
 ///
 /// Compute the Message Integrity Code (MIC).
-/// The AUTHENTICATE_MESSAGE must have its MIC field zeroed out before hashing.
-/// 
 let internal computeMic (exportedSessionKey : byte array) (negotiateMessage : byte array) (challengeMessage : byte array) (authenticateMessage : byte array) : byte array =
     use hmac = new HMACMD5(exportedSessionKey)
     hmac.ComputeHash(concatMany [| negotiateMessage; challengeMessage; authenticateMessage |])
@@ -123,16 +119,12 @@ let internal computeMic (exportedSessionKey : byte array) (negotiateMessage : by
 type NtlmV2Response =
     { lmResponse : byte array
       ntResponse : byte array
-      ///
-      /// Key used for SMB signing / sealing after auth (ExportedSessionKey).
       exportedSessionKey : byte array
-      ///
-      /// EncryptedRandomSessionKey payload (16 bytes when KEY_EXCH, else empty).
       encryptedRandomSessionKey : byte array }
 
 
 ///
-/// RC4 encrypt/decrypt (same operation). Used for NTLM KEY_EXCH.
+/// RC4 encrypt/decrypt
 let private rc4 (key : byte array) (data : byte array) : byte array =
     let s = Array.init 256 id
     let mutable j = 0
@@ -156,15 +148,15 @@ let private rc4 (key : byte array) (data : byte array) : byte array =
 
 
 ///
-/// Compute the complete NetNTLMv2 response from password, username, domain,
-/// and the server's CHALLENGE_MESSAGE. Honors NEGOTIATE_KEY_EXCH when set.
-/// 
+/// Compute the complete NetNTLMv2
 let internal computeNtlmV2Response (password : string) (username : string) (domain : string) (challenge : ChallengeMessage) : NtlmV2Response =
     let ntHash = computeNtHash password
     let ntlmV2Hash = computeNtlmV2Hash ntHash username domain
     let clientChallenge = Array.zeroCreate<byte> 8
+    
     use rng = RandomNumberGenerator.Create()
     rng.GetBytes clientChallenge 
+    
     let clientBlob =
         buildClientBlob clientChallenge challenge.targetInfo
             (challenge.targetInfo |> extractTimestamp)
@@ -173,6 +165,7 @@ let internal computeNtlmV2Response (password : string) (username : string) (doma
     let lmResponse = computeLmV2Response ntlmV2Hash challenge.serverChallenge clientChallenge
     let keyExchangeKey = computeExportedSessionKey ntlmV2Hash ntProofStr
     let keyExch =  challenge.negotiateFlags &&& NtlmFlags.NegotiateKeyExch <> 0u
+    
     let exportedSessionKey, encryptedRandomSessionKey =
         match keyExch with
         | false -> keyExchangeKey, [||]
@@ -181,6 +174,7 @@ let internal computeNtlmV2Response (password : string) (username : string) (doma
             rng.GetBytes randomKey 
             let enc = rc4 keyExchangeKey randomKey
             randomKey, enc
+    
     { lmResponse = lmResponse
       ntResponse = ntResponse
       exportedSessionKey = exportedSessionKey

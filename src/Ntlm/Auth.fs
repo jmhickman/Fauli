@@ -39,7 +39,7 @@ let private appendChunkIfPresent (buffer : ResizeArray<byte>) (chunk : byte arra
 
 
 ///
-/// Drain the TCP stream into a byte array (read until EOF / zero-length read).
+/// Drain the TCP stream into a byte array
 let private drainStream (stream : NetworkStream) : byte array =
     let buffer = ResizeArray<byte>()
     let chunk = Array.zeroCreate<byte> 4096
@@ -53,9 +53,6 @@ let private drainStream (stream : NetworkStream) : byte array =
 
 ///
 /// Send an NTLMSSP message over a TCP connection and read the server's response.
-/// NTLMSSP messages are sent as raw bytes (no length prefix — the protocol
-/// handler wraps them in SPNEGO or SMB negotiate).
-/// 
 let private sendNtlmMessage (client : TcpClient) (message : byte array) : byte array =
     let stream = client.GetStream()
     stream.Write(message, 0, message.Length)
@@ -83,7 +80,7 @@ let internal parseChallenge (data : byte array) : Result<ChallengeMessage, AuthE
     try
         decodeChallengeMessage data |> Ok
     with ex ->
-        (mapChallengeParseException ex) |> Error
+        mapChallengeParseException ex |> Error
 
 
 ///
@@ -112,6 +109,7 @@ let internal buildAuthenticateMessage (negotiateFlags : uint32) (ntlmV2Resp : Nt
             micPlaceholder
     let mic = computeMic ntlmV2Resp.exportedSessionKey negotiateMsg challengeMsg authMsg
     Array.Copy(mic, 0, authMsg, 72, 16)
+    
     authMsg
 
 
@@ -159,8 +157,6 @@ let private mapNtlmTransportException (ex : exn) : AuthError =
 
 ///
 /// Perform the complete NetNTLMv2 three-message exchange over an existing TCP connection.
-/// Returns the NTLM auth response that can be used by protocol handlers.
-/// 
 let internal authenticateWithNtlmV2 (client : TcpClient) (username : string) (password : string) (domain : string) (workstation : string option) : Result<NtlmResult, AuthError> =
     let negotiateMsg = buildNegotiateMessage (Some domain) workstation
     try
