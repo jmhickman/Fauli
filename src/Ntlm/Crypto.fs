@@ -10,6 +10,21 @@ open Fauli.Ntlm.Encoding
 
 
 ///
+/// Result of computing the NetNTLMv2 response.
+type NtlmV2Response =
+    { lmResponse : byte array
+      ntResponse : byte array
+      exportedSessionKey : byte array
+      encryptedRandomSessionKey : byte array }
+
+
+///
+/// MsvAvFlags = 0x00000002: authentication MIC is present ([MS-NLMP] §2.2.2.1).
+let private micPresentFlag : AvPair =
+    { avId = AvId.MsvAvFlags; value = BitConverter.GetBytes 0x00000002u }
+
+
+///
 /// Concatenate two byte arrays.
 let private concat2 (a : byte array) (b : byte array) : byte array =
     let result = Array.zeroCreate<byte> (a.Length + b.Length)
@@ -63,12 +78,6 @@ let private clientBlobTimestamp (serverTimestamp : DateTime option) : byte array
 /// Drop EOL (re-emitted by encodeAvPairs) and any server MsvAvFlags we will replace.
 let private isRetainedAvPair (pair : AvPair) : bool =
     pair.avId <> AvId.MsvAvEOL && pair.avId <> AvId.MsvAvFlags
-
-
-///
-/// MsvAvFlags = 0x00000002: authentication MIC is present ([MS-NLMP] §2.2.2.1).
-let private micPresentFlag : AvPair =
-    { avId = AvId.MsvAvFlags; value = BitConverter.GetBytes 0x00000002u }
 
 
 let private withMicPresentFlag (pairs : AvPair list) : AvPair list =
@@ -133,15 +142,6 @@ let internal computeExportedSessionKey (ntlmV2Hash : byte array) (ntProofStr : b
 let internal computeMic (exportedSessionKey : byte array) (negotiateMessage : byte array) (challengeMessage : byte array) (authenticateMessage : byte array) : byte array =
     use hmac = new HMACMD5(exportedSessionKey)
     hmac.ComputeHash(concatMany [| negotiateMessage; challengeMessage; authenticateMessage |])
-
-
-///
-/// Result of computing the NetNTLMv2 response.
-type NtlmV2Response =
-    { lmResponse : byte array
-      ntResponse : byte array
-      exportedSessionKey : byte array
-      encryptedRandomSessionKey : byte array }
 
 
 ///

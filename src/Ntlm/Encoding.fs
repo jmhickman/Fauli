@@ -7,6 +7,68 @@ open System.Text
 open Fauli.Domain
 
 
+type AvId =
+    | MsvAvEOL = 0x0000
+    | MsvAvNbComputerName = 0x0001
+    | MsvAvNbDomainName = 0x0002
+    | MsvAvDnsComputerName = 0x0003
+    | MsvAvDnsDomainName = 0x0004
+    | MsvAvDnsTreeName = 0x0005
+    | MsvAvTimestamp = 0x0007
+    | MsvAvSingleHost = 0x0008
+    | MsvAvTargetName = 0x0009
+    | MsvAvChannelBindings = 0x000A
+    | MsvAvFlags = 0x000B
+
+
+///
+/// AV_PAIR: AvId (2 bytes LE) + AvLen (2 bytes LE) + Value (AvLen bytes).
+type AvPair = { avId : AvId; value : byte array }
+
+
+///
+/// Parsed CHALLENGE_MESSAGE fields.
+type ChallengeMessage =
+    { targetName : string option
+      negotiateFlags : uint32
+      serverChallenge : byte array  // 8 bytes
+      targetInfo : AvPair list }
+
+
+type DecodeChallengeMessage = byte array -> Result<ChallengeMessage, AuthError>
+
+
+type private ChallengeParseState =
+    { data : byte array
+      negotiateFlags : uint32
+      serverChallenge : byte array
+      targetName : string option
+      targetInfo : AvPair list }
+
+
+///
+/// AUTHENTICATE_MESSAGE (Type 3) fields to encode.
+type AuthenticateMessage =
+    { negotiateFlags : uint32
+      lmResponse : byte array
+      ntResponse : byte array
+      domain : string
+      username : string
+      workstation : string
+      encryptedRandomSessionKey : byte array
+      mic : byte array }
+
+
+type EncodeAuthenticateMessage = AuthenticateMessage -> byte array
+
+
+///
+/// One Type-3 payload and the offset of its 8-byte security buffer ([MS-NLMP] §2.2.1.3).
+type private AuthenticateField =
+    { securityBufferOffset : int
+      payload : byte array }
+
+
 let private signature = Fauli.Constants.ntlmsspSignature  // "NTLMSSP\0"
 
 
@@ -28,6 +90,11 @@ let private authenticateFlagsOffset = 60
 
 
 let private authenticateMicOffset = 72
+
+
+///
+/// Minimum CHALLENGE_MESSAGE size: TargetInfoFields occupy offsets 40–47 ([MS-NLMP] §2.2.1.2).
+let private challengeHeaderLength = 48
 
 
 ///
@@ -73,25 +140,6 @@ let defaultNegotiateFlags : uint32 =
     NtlmFlags.NegotiateKeyExch |||
     NtlmFlags.Negotiate128 |||
     NtlmFlags.Negotiate56
-
-
-type AvId =
-    | MsvAvEOL = 0x0000
-    | MsvAvNbComputerName = 0x0001
-    | MsvAvNbDomainName = 0x0002
-    | MsvAvDnsComputerName = 0x0003
-    | MsvAvDnsDomainName = 0x0004
-    | MsvAvDnsTreeName = 0x0005
-    | MsvAvTimestamp = 0x0007
-    | MsvAvSingleHost = 0x0008
-    | MsvAvTargetName = 0x0009
-    | MsvAvChannelBindings = 0x000A
-    | MsvAvFlags = 0x000B
-
-
-///
-/// AV_PAIR: AvId (2 bytes LE) + AvLen (2 bytes LE) + Value (AvLen bytes).
-type AvPair = { avId : AvId; value : byte array }
 
 
 let private writeUint16Le (arr : byte array) (offset : int) (value : uint16) : unit =
@@ -257,36 +305,11 @@ let internal encodeNegotiateMessage (domain : string option) (workstation : stri
 
 
 ///
-/// Parsed CHALLENGE_MESSAGE fields.
-type ChallengeMessage =
-    { targetName : string option
-      negotiateFlags : uint32
-      serverChallenge : byte array  // 8 bytes
-      targetInfo : AvPair list }
-
-
-type DecodeChallengeMessage = byte array -> Result<ChallengeMessage, AuthError>
-
-
-///
-/// Minimum CHALLENGE_MESSAGE size: TargetInfoFields occupy offsets 40–47 ([MS-NLMP] §2.2.1.2).
-let private challengeHeaderLength = 48
-
-
-///
 /// Decode a target name string from raw bytes using the negotiated encoding.
 let private decodeTargetNameString (negotiateFlags : uint32) (bytes : byte array) : string =
     match negotiateFlags &&& uint32 NtlmFlags.NegotiateUnicode <> 0u with
     | true -> Encoding.Unicode.GetString bytes
     | false -> Encoding.Default.GetString bytes
-
-
-type private ChallengeParseState =
-    { data : byte array
-      negotiateFlags : uint32
-      serverChallenge : byte array
-      targetName : string option
-      targetInfo : AvPair list }
 
 
 ///
@@ -418,29 +441,6 @@ let internal decodeChallengeMessage : DecodeChallengeMessage = fun data ->
     |> readTargetName
     |> readTargetInfo
     |> finishChallengeMessage
-
-
-///
-/// AUTHENTICATE_MESSAGE (Type 3) fields to encode.
-type AuthenticateMessage =
-    { negotiateFlags : uint32
-      lmResponse : byte array
-      ntResponse : byte array
-      domain : string
-      username : string
-      workstation : string
-      encryptedRandomSessionKey : byte array
-      mic : byte array }
-
-
-type EncodeAuthenticateMessage = AuthenticateMessage -> byte array
-
-
-///
-/// One Type-3 payload and the offset of its 8-byte security buffer ([MS-NLMP] §2.2.1.3).
-type private AuthenticateField =
-    { securityBufferOffset : int
-      payload : byte array }
 
 
 ///
