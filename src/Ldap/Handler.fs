@@ -26,6 +26,13 @@ type internal LdapBindResult =
 
 
 ///
+/// Definite BER length: the length-prefix octets and the content length they encode.
+type private BerLength =
+    { prefix : byte array
+      contentLen : int }
+
+
+///
 /// LDAP resultCode values we care about (RFC 4511 §4.1.9).
 let private ldapSuccess = 0
 
@@ -85,7 +92,7 @@ let private tryReadByte (stream : Stream) : int option =
 /// Fold big-endian length octets into an integer.
 let private foldBigEndianLength (bytes : byte array) : int =
     bytes
-    |> Array.fold (fun acc b -> (acc <<< 8) ||| int b) 0
+    |> Array.fold (fun acc b -> acc <<< 8 ||| int b) 0
 
 
 ///
@@ -102,22 +109,55 @@ let private tryFillBuffer (stream : Stream) (buffer : byte array) : bool =
 
 
 ///
+/// Short-form length: high bit clear, value is the content length ([X.690] §8.1.3.4).
+let private isShortForm (lenFirst : int) : bool =
+    lenFirst &&& 0x80 = 0
+
+
+///
+/// Long-form octet count: low 7 bits, must be 1–4.
+let private longFormOctetCount (lenFirst : int) : int option =
+    match lenFirst &&& 0x7F with
+    | n when n > 0 && n <= 4 -> Some n
+    | _ -> None
+
+
+let private shortBerLength (lenFirst : int) : BerLength =
+    { prefix = [| byte lenFirst |]
+      contentLen = lenFirst }
+
+
+let private berLengthOf (lenFirst : int) (lenBytes : byte array) : BerLength =
+    { prefix = Array.append [| byte lenFirst |] lenBytes
+      contentLen = foldBigEndianLength lenBytes }
+
+
+let private asPrefixAndLen (parsed : BerLength) : byte array * int =
+    parsed.prefix, parsed.contentLen
+
+
+let private readLongOctets (stream : Stream) (num : int) : byte array option =
+    let buf = Array.zeroCreate num
+    match tryFillBuffer stream buf with
+    | true -> Some buf
+    | false -> None
+
+
+let private decodeLongLengthPrefix (stream : Stream) (lenFirst : int) : BerLength option =
+    longFormOctetCount lenFirst
+    |> Option.bind (readLongOctets stream)
+    |> Option.map (berLengthOf lenFirst)
+
+
+///
 /// Decode definite BER length after the first length octet has been read.
 /// Returns (length-prefix-bytes including first octet, content length) or None.
-/// 
 let private decodeBerLengthPrefix (stream : Stream) (lenFirst : int) : (byte array * int) option =
-    match lenFirst &&& 0x80 = 0 with
-    | true -> Some ([| byte lenFirst |], lenFirst)
+    match isShortForm lenFirst with
+    | true -> shortBerLength lenFirst |> asPrefixAndLen |> Some
     | false ->
-        let num = lenFirst &&& 0x7F
-        match num <= 0 || num > 4 with
-        | true -> None
-        | false ->
-            let lenBytes = Array.zeroCreate<byte> num
-            match tryFillBuffer stream lenBytes with
-            | false -> None
-            | true ->
-                Some (Array.concat [| [| byte lenFirst |]; lenBytes |], foldBigEndianLength lenBytes)
+        decodeLongLengthPrefix stream lenFirst
+        |> Option.map asPrefixAndLen
 
 
 ///
@@ -142,7 +182,7 @@ let private readBerLength (stream : Stream) : Result<byte array * int, AuthError
     | Ok lenFirst ->
         match decodeBerLengthPrefix stream lenFirst with
         | None -> UnexpectedError "LDAP receive: invalid BER length" |> Error
-        | Some (prefix, len) when len < 0 -> UnexpectedError "LDAP receive: invalid BER length" |> Error
+        | Some (_, len) when len < 0 -> UnexpectedError "LDAP receive: invalid BER length" |> Error
         | Some (prefix, len) -> (prefix, len) |> Ok
 
 
@@ -186,25 +226,38 @@ let private decodeSmallInt (bytes : byte array) : int option =
 
 
 ///
+/// TLV span from a tag at `pos` and a decoded length prefix starting at `pos + 1`.
+let private spanFromLength (pos : int) (parsed : BerLength) : int * int * int =
+    let contentStart = pos + 1 + parsed.prefix.Length
+    contentStart, parsed.contentLen, contentStart + parsed.contentLen
+
+
+let private longOctetsAt (buf : byte array) (pos : int) (num : int) : byte array option =
+    match pos + 2 + num > buf.Length with
+    | true -> None
+    | false -> Some (Array.sub buf (pos + 2) num)
+
+
+let private longSpanAt (buf : byte array) (pos : int) (lenFirst : int) (lenBytes : byte array) : int * int * int =
+    spanFromLength pos (berLengthOf lenFirst lenBytes)
+
+
+let private decodeLongLengthAt (buf : byte array) (pos : int) (lenFirst : int) : (int * int * int) option =
+    longFormOctetCount lenFirst
+    |> Option.bind (longOctetsAt buf pos)
+    |> Option.map (longSpanAt buf pos lenFirst)
+
+
+///
 /// Decode BER length at a buffer offset. Returns (contentStart, contentLen, nextPos) or None.
 let private decodeLengthAt (buf : byte array) (pos : int) : (int * int * int) option =
     match pos + 1 >= buf.Length with
     | true -> None
     | false ->
-        let lb = buf.[pos + 1]
-        match (lb &&& 0x80uy) = 0uy with
-        | true ->
-            let len = int lb
-            Some (pos + 2, len, pos + 2 + len)
-        | false ->
-            let num = int (lb &&& 0x7Fuy)
-            match num <= 0 || num > 4 || pos + 2 + num > buf.Length with
-            | true -> None
-            | false ->
-                let lenBytes = Array.sub buf (pos + 2) num
-                let len = foldBigEndianLength lenBytes
-                let cs = pos + 2 + num
-                Some (cs, len, cs + len)
+        let lenFirst = int buf.[pos + 1]
+        match isShortForm lenFirst with
+        | true -> spanFromLength pos (shortBerLength lenFirst) |> Some
+        | false -> decodeLongLengthAt buf pos lenFirst
 
 
 ///
@@ -216,7 +269,7 @@ let private readTlv (buf : byte array) (pos : int) : (byte * byte array * int) o
         let tag = buf.[pos]
         match decodeLengthAt buf pos with
         | None -> None
-        | Some (contentStart, contentLen, next) when contentLen < 0 || next > buf.Length -> None
+        | Some (_, contentLen, next) when contentLen < 0 || next > buf.Length -> None
         | Some (contentStart, contentLen, next) ->
             Some (tag, Array.sub buf contentStart contentLen, next)
 
@@ -238,6 +291,7 @@ let private extractBindBody (top : (byte * byte array) list) (data : byte array)
             match t2 with
             | 0x61uy -> Some c2
             | _ -> None)
+    
     let fromTop =
         top
         |> List.tryPick (fun (tag, content) ->
@@ -245,6 +299,7 @@ let private extractBindBody (top : (byte * byte array) list) (data : byte array)
             | 0x61uy -> Some content
             | 0x30uy -> fromNestedSequence content
             | _ -> None)
+    
     match fromTop with
     | Some body -> body
     | None ->
@@ -358,22 +413,19 @@ let private performKerberosSaslBind (stream : Stream) (authParams : KerberosTick
 /// Clamp a machine name into a 15-char NetBIOS-style workstation label.
 let private clampWorkstationName (name : string) : string =
     match String.IsNullOrWhiteSpace name with
-    | true -> "DESKTOP-FAULI"
     | false when name.Length <= 15 -> name.ToUpperInvariant()
     | false -> name.Substring(0, 15).ToUpperInvariant()
+    | _ -> "DESKTOP-DKTBI"
 
 
 ///
-/// Workstation name for NTLM — host-derived, not a hardcoded tool banner.
+/// Workstation name for NTLM
 let private ntlmWorkstationName () : string =
-    try clampWorkstationName Environment.MachineName
-    with _ -> "DESKTOP-FAULI"
+    clampWorkstationName Environment.MachineName
 
 
 ///
 /// LDAP SASL NTLM Type1 flags.
-/// IMPORTANT: Do NOT set NegotiateSign / NegotiateSeal / NegotiateKeyExch until a security-layer is implemented.
-/// 
 let private ldapNtlmType1Flags : uint32 =
     NtlmFlags.NegotiateUnicode
     ||| NtlmFlags.RequestTarget
@@ -392,9 +444,9 @@ let private overwriteNtlmFlags (buf : byte array) (flags : uint32) : byte array 
     | false -> buf
     | true ->
         buf.[12] <- byte (flags &&& 0xFFu)
-        buf.[13] <- byte ((flags >>> 8) &&& 0xFFu)
-        buf.[14] <- byte ((flags >>> 16) &&& 0xFFu)
-        buf.[15] <- byte ((flags >>> 24) &&& 0xFFu)
+        buf.[13] <- byte (flags >>> 8 &&& 0xFFu)
+        buf.[14] <- byte (flags >>> 16 &&& 0xFFu)
+        buf.[15] <- byte (flags >>> 24 &&& 0xFFu)
         buf
 
 
@@ -431,6 +483,7 @@ let private findNtlmPayload (serverSaslCreds : byte array) : byte array option =
 /// Extract NTLMSSP Type2 bytes from serverSaslCreds (SPNEGO NegTokenResp or raw NTLM).
 let private extractNtlmType2 (serverSaslCreds : byte array) : byte array =
     let _, mechOpt = parseSnegoNegTokenResp serverSaslCreds
+    
     match mechOpt with
     | Some t when looksLikeNtlmType2 t -> t
     | _ -> defaultArg (findNtlmPayload serverSaslCreds) [||]
@@ -511,6 +564,7 @@ let private performNtlmSaslBind (stream : Stream) (authParams : NtlmResponsePara
     let workstation = ntlmWorkstationName ()
     let type1 = buildNtlmType1 domain workstation
     let token1 = wrapNtlmSpnego type1
+    
     exchangeSaslBind stream 1 token1
     |> requireSaslInProgress
     |> continueNtlmAfterLeg1Creds stream password user domain workstation type1
@@ -544,6 +598,11 @@ let private mapTlsException (ex : exn) : AuthError =
 
 
 ///
+/// We don't validate anything, because we don't care
+let sslCallbackHandlerTrue = fun _ _ _ _ -> true
+
+
+///
 /// Perform the implicit-TLS client handshake on a plain stream.
 /// Returns the authenticated SslStream (as Stream) on success.
 /// Fauli is a pentesting library and does not validate server identity:
@@ -551,7 +610,7 @@ let private mapTlsException (ex : exn) : AuthError =
 let internal authenticateTls (host : Host) (stream : Stream) : Result<Stream, AuthError> =
     let (Host hostStr) = host
     try
-        let sslStream = new SslStream(stream, false, (fun _ _ _ _ -> true))
+        let sslStream = new SslStream(stream, false, sslCallbackHandlerTrue)
         sslStream.AuthenticateAsClient hostStr
         (sslStream : Stream) |> Ok
     with ex ->
