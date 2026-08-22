@@ -19,6 +19,58 @@ type TicketParseError =
 
 
 ///
+/// Parsed credential info from one KrbCredInfo entry in a .kirbi file.
+type KirbiCredInfo =
+    { sessionKey : Key
+      clientName : string list
+      clientRealm : string option
+      serverName : string list
+      serverRealm : string option
+      endtime : DateTime option
+      ticketBytes : byte array }
+
+
+///
+/// Binary reader state for .ccache parsing.
+type CcacheReader =
+    { data : byte array
+      pos : int }
+
+
+///
+/// After keyblock: skip timestamps, flags, addresses, authdata; return endtime + ticket + next reader.
+type private CredentialTail =
+    { reader : CcacheReader
+      endTimeTs : uint32
+      ticketBytes : byte array }
+
+
+///
+/// Parsed credential from a .ccache file.
+type CcacheCredential =
+    { clientName : string list
+      clientRealm : string
+      serverName : string list
+      serverRealm : string
+      sessionKey : Key
+      endtime : DateTime option
+      ticketBytes : byte array }
+
+
+type private CcachePrincipals =
+    { clientName : string list
+      clientRealm : string
+      serverName : string list
+      serverRealm : string }
+
+
+///
+/// Mutable byte buffer used only at the serialization edge.
+type private CcacheWriter =
+    { buffer : ResizeArray<byte> }
+
+
+///
 /// Kerberos string component from a BER name-string element.
 let private kerberosStringFromBer (str : BerValue) : string option =
     match str with
@@ -86,11 +138,13 @@ let private parseEncryptionKey (v : BerValue) : Key option =
     | BerSequence kf ->
         let keyType = integerAtOr kf 0 -1
         let keyValue = octetStringAtOrEmpty kf 1
+        
         match keyType <> -1 && keyValue.Length > 0 with
         | true ->
-            Some
-                { enctype = enum<EncryptionType> keyType
-                  contents = keyValue }
+            { enctype = enum<EncryptionType> keyType
+              contents = keyValue } 
+            |> Some
+                
         | false -> None
     | _ -> None
 
@@ -105,18 +159,6 @@ let private sessionKeyFromCredInfo (items : BerValue list) : Key =
     | Some (BerSequence kf) -> defaultArg (parseEncryptionKey (BerSequence kf)) fallback
     | Some v -> defaultArg (parseEncryptionKey v) fallback
     | None -> fallback
-
-
-///
-/// Parsed credential info from one KrbCredInfo entry in a .kirbi file.
-type KirbiCredInfo =
-    { sessionKey : Key
-      clientName : string list
-      clientRealm : string option
-      serverName : string list
-      serverRealm : string option
-      endtime : DateTime option
-      ticketBytes : byte array }
 
 
 ///
@@ -145,14 +187,15 @@ let private parseKrbCredInfo (items : BerValue list) : KirbiCredInfo option =
         match contextAt items 6 with
         | Some v -> asGeneralizedTime v
         | None -> None
-    Some
-        { sessionKey = sessionKeyFromCredInfo items
-          clientName = clientName
-          clientRealm = generalStringAt items 1
-          serverName = serverName
-          serverRealm = generalStringAt items 8
-          endtime = endtime
-          ticketBytes = [||] }
+    
+    { KirbiCredInfo.sessionKey = sessionKeyFromCredInfo items
+      clientName = clientName
+      clientRealm = generalStringAt items 1
+      serverName = serverName
+      serverRealm = generalStringAt items 8
+      endtime = endtime
+      ticketBytes = [||] }
+    |> Some
 
 
 ///
@@ -244,6 +287,7 @@ let private extractRawTickets (rawData : byte array) : byte array list =
     let appCs, _ = parseTlvBytes rawData 0
     let seqCs, seqCe = parseTlvBytes rawData appCs
     let seqItems = parseSequenceItems rawData seqCs seqCe
+    
     match findTicketsContextOffset rawData seqItems with
     | None -> []
     | Some ticketsCtx ->
@@ -270,10 +314,8 @@ let private ticketInfoSequence (encFields : BerValue list) : BerValue list =
 ///
 /// Build credential list with paired ticket TLVs from a parsed EncKrbCredPart.
 let private credentialsFromEncKrbCredPart (rawData : byte array) (encFields : BerValue list) : Result<KirbiCredInfo, TicketParseError> =
-    let credInfos = parseKrbCredInfoList (ticketInfoSequence encFields)
-    let rawTickets = extractRawTickets rawData
-    credInfos
-    |> List.mapi (pairCredWithTicket rawTickets)
+    parseKrbCredInfoList (ticketInfoSequence encFields)
+    |> List.mapi (rawData |> extractRawTickets |> pairCredWithTicket)
     |> findTgtInKirbi
 
 
@@ -282,6 +324,7 @@ let private credentialsFromEncKrbCredPart (rawData : byte array) (encFields : Be
 let private parseKirbiFromCredSequence (rawData : byte array) (fields : BerValue list) : Result<KirbiCredInfo, TicketParseError> =
     let encPartVal = defaultArg (contextAt fields 3) (BerSequence [])
     let _, cipherBytes = encryptedDataParts encPartVal
+    
     match cipherBytes.Length = 0 with
     | true -> InvalidKirbiFormat |> Error
     | false ->
@@ -304,160 +347,306 @@ let parseKirbi (rawData : byte array) : Result<KirbiCredInfo, TicketParseError> 
         ParseError ex.Message |> Error
 
 
-///
-/// Binary reader state for .ccache parsing.
-type CcacheReader =
-    { data : byte array
-      pos : int }
-
-
-let private ccacheCheck (r : CcacheReader) (needed : int) : unit =
+let private ccacheRequire (r : CcacheReader) (needed : int) : Result<CcacheReader, TicketParseError> =
     match r.pos + needed > r.data.Length with
-    | true ->
-        invalidArg "data" $"Expected {needed} bytes at position {r.pos}, but only {r.data.Length - r.pos} remaining"
-    | false -> ()
+    | true -> InvalidCcacheFormat |> Error
+    | false -> r |> Ok
 
 
-let private ccacheReadBytes (r : CcacheReader) (count : int) : byte array * CcacheReader =
-    ccacheCheck r count
-    Array.sub r.data r.pos count, { r with pos = r.pos + count }
+let private ccacheReadBytes (r : CcacheReader) (count : int) : Result<byte array * CcacheReader, TicketParseError> =
+    match ccacheRequire r count with
+    | Error e -> e |> Error
+    | Ok ready ->
+        (Array.sub ready.data ready.pos count, { ready with pos = ready.pos + count }) |> Ok
 
 
-let private ccacheReadByte (r : CcacheReader) : byte * CcacheReader =
-    ccacheCheck r 1
-    r.data.[r.pos], { r with pos = r.pos + 1 }
+let private ccacheReadByte (r : CcacheReader) : Result<byte * CcacheReader, TicketParseError> =
+    match ccacheRequire r 1 with
+    | Error e -> e |> Error
+    | Ok ready ->
+        (ready.data.[ready.pos], { ready with pos = ready.pos + 1 }) |> Ok
 
 
 ///
 /// Read a big-endian uint16 (network byte order).
-let private ccacheReadUint16 (r : CcacheReader) : uint16 * CcacheReader =
-    let bytes, r' = ccacheReadBytes r 2
-    uint16 (int bytes.[0] <<< 8 ||| int bytes.[1]), r'
+let private ccacheReadUint16 (r : CcacheReader) : Result<uint16 * CcacheReader, TicketParseError> =
+    match ccacheReadBytes r 2 with
+    | Error e -> e |> Error
+    | Ok (bytes, r') -> (uint16 (int bytes.[0] <<< 8 ||| int bytes.[1]), r') |> Ok
 
 
 ///
 /// Read a big-endian uint32 (network byte order).
-let private ccacheReadUint32 (r : CcacheReader) : uint32 * CcacheReader =
-    let b0, r1 = ccacheReadByte r
-    let b1, r2 = ccacheReadByte r1
-    let b2, r3 = ccacheReadByte r2
-    let b3, r4 = ccacheReadByte r3
-    (uint32 b0 <<< 24) ||| (uint32 b1 <<< 16) ||| (uint32 b2 <<< 8) ||| uint32 b3, r4
+let private ccacheReadUint32 (r : CcacheReader) : Result<uint32 * CcacheReader, TicketParseError> =
+    match ccacheReadBytes r 4 with
+    | Error e -> e |> Error
+    | Ok (b, r') ->
+        ((uint32 b.[0] <<< 24) ||| (uint32 b.[1] <<< 16) ||| (uint32 b.[2] <<< 8) ||| uint32 b.[3], r') |> Ok
 
 
 ///
 /// Read a CountedOctetString: uint32 length + that many bytes.
-let private ccacheReadCountedOctetString (r : CcacheReader) : byte array * CcacheReader =
-    let len, r' = ccacheReadUint32 r
-    ccacheReadBytes r' (int len)
+let private ccacheReadCountedOctetString (r : CcacheReader) : Result<byte array * CcacheReader, TicketParseError> =
+    match ccacheReadUint32 r with
+    | Error e -> e |> Error
+    | Ok (len, r') -> ccacheReadBytes r' (int len)
 
 
 ///
 /// Read a CountedOctetString as ASCII string.
-let private ccacheReadString (r : CcacheReader) : string * CcacheReader =
-    let bytes, r' = ccacheReadCountedOctetString r
-    System.Text.Encoding.ASCII.GetString bytes, r'
+let private ccacheReadString (r : CcacheReader) : Result<string * CcacheReader, TicketParseError> =
+    match ccacheReadCountedOctetString r with
+    | Error e -> e |> Error
+    | Ok (bytes, r') -> (System.Text.Encoding.ASCII.GetString bytes, r') |> Ok
 
 
 ///
 /// Parse a ccache Principal (version 4).
-let private ccacheReadPrincipal (r : CcacheReader) : (int * string list * string) * CcacheReader =
-    let nameType, r1 = ccacheReadUint32 r
-    let numComponents, r2 = ccacheReadUint32 r1
-    let realm, r3 = ccacheReadString r2
-    let rec readComponents i acc reader =
-        match i >= int numComponents with
-        | true -> List.rev acc, reader
+let private ccacheReadComponents (count : int) (r : CcacheReader) : Result<string list * CcacheReader, TicketParseError> =
+    let rec loop i acc reader =
+        match i >= count with
+        | true -> (List.rev acc, reader) |> Ok
         | false ->
-            let comp, r' = ccacheReadString reader
-            readComponents (i + 1) (comp :: acc) r'
-    let components, rFinal = readComponents 0 [] r3
-    (int nameType, components, realm), rFinal
+            match ccacheReadString reader with
+            | Error e -> e |> Error
+            | Ok (comp, r') -> loop (i + 1) (comp :: acc) r'
+    loop 0 [] r
+
+
+let private principalWithComponents (nameType : uint32) (numComponents : uint32) (realm : string) (r3 : CcacheReader) : Result<(int * string list * string) * CcacheReader, TicketParseError> =
+    match ccacheReadComponents (int numComponents) r3 with
+    | Error e -> e |> Error
+    | Ok (components, rFinal) -> ((int nameType, components, realm), rFinal) |> Ok
+
+
+let private finishPrincipal (nameType : uint32) (numComponents : uint32) (r2 : CcacheReader) : Result<(int * string list * string) * CcacheReader, TicketParseError> =
+    match ccacheReadString r2 with
+    | Error e -> e |> Error
+    | Ok (realm, r3) -> principalWithComponents nameType numComponents realm r3
+
+
+let private readPrincipalAfterNameType (nameType : uint32) (r1 : CcacheReader) : Result<(int * string list * string) * CcacheReader, TicketParseError> =
+    match ccacheReadUint32 r1 with
+    | Error e -> e |> Error
+    | Ok (numComponents, r2) -> finishPrincipal nameType numComponents r2
+
+
+let private ccacheReadPrincipal (r : CcacheReader) : Result<(int * string list * string) * CcacheReader, TicketParseError> =
+    match ccacheReadUint32 r with
+    | Error e -> e |> Error
+    | Ok (nameType, r1) -> readPrincipalAfterNameType nameType r1
 
 
 ///
 /// Parse a KeyBlockV4.
-let private ccacheReadKeyBlockV4 (r : CcacheReader) : Key * CcacheReader =
-    let keyType, r1 = ccacheReadUint16 r
-    let _, r2 = ccacheReadUint16 r1  // etype — duplicate, ignored
-    let keyLen, r3 = ccacheReadUint16 r2
-    let keyValue, r4 = ccacheReadBytes r3 (int keyLen)
-    { enctype = enum<EncryptionType> (int keyType)
-      contents = keyValue }, r4
+let private readKeyValue (keyType : uint16) (keyLen : uint16) (r3 : CcacheReader) : Result<Key * CcacheReader, TicketParseError> =
+    match ccacheReadBytes r3 (int keyLen) with
+    | Error e -> e |> Error
+    | Ok (keyValue, r4) ->
+        ({ enctype = enum<EncryptionType> (int keyType)
+           contents = keyValue }, r4) |> Ok
+
+
+let private readKeyLength (keyType : uint16) (r2 : CcacheReader) : Result<Key * CcacheReader, TicketParseError> =
+    match ccacheReadUint16 r2 with
+    | Error e -> e |> Error
+    | Ok (keyLen, r3) -> readKeyValue keyType keyLen r3
+
+
+let private skipDuplicateEtype (keyType : uint16) (r1 : CcacheReader) : Result<Key * CcacheReader, TicketParseError> =
+    match ccacheReadUint16 r1 with
+    | Error e -> e |> Error
+    | Ok (_, r2) -> readKeyLength keyType r2
+
+
+let private ccacheReadKeyBlockV4 (r : CcacheReader) : Result<Key * CcacheReader, TicketParseError> =
+    match ccacheReadUint16 r with
+    | Error e -> e |> Error
+    | Ok (keyType, r1) -> skipDuplicateEtype keyType r1
 
 
 ///
 /// Parse an Address: addrtype (uint16), addrdata (CountedOctetString).
-let private ccacheReadAddress (r : CcacheReader) : CcacheReader =
-    let _, r1 = ccacheReadUint16 r
-    let _, r2 = ccacheReadCountedOctetString r1
-    r2
+let private skipAddressData (r1 : CcacheReader) : Result<CcacheReader, TicketParseError> =
+    match ccacheReadCountedOctetString r1 with
+    | Error e -> e |> Error
+    | Ok (_, r2) -> r2 |> Ok
+
+
+let private ccacheReadAddress (r : CcacheReader) : Result<CcacheReader, TicketParseError> =
+    match ccacheReadUint16 r with
+    | Error e -> e |> Error
+    | Ok (_, r1) -> skipAddressData r1
 
 
 ///
 /// Parse an AuthData: authtype (uint16), authdata (CountedOctetString).
-let private ccacheReadAuthData (r : CcacheReader) : CcacheReader =
-    let _, r1 = ccacheReadUint16 r
-    let _, r2 = ccacheReadCountedOctetString r1
-    r2
+let private skipAuthDataPayload (r1 : CcacheReader) : Result<CcacheReader, TicketParseError> =
+    match ccacheReadCountedOctetString r1 with
+    | Error e -> e |> Error
+    | Ok (_, r2) -> r2 |> Ok
+
+
+let private ccacheReadAuthData (r : CcacheReader) : Result<CcacheReader, TicketParseError> =
+    match ccacheReadUint16 r with
+    | Error e -> e |> Error
+    | Ok (_, r1) -> skipAuthDataPayload r1
 
 
 ///
 /// Skip N address records.
-let private ccacheSkipAddresses (count : int) (r : CcacheReader) : CcacheReader =
+let private ccacheSkipAddresses (count : int) (r : CcacheReader) : Result<CcacheReader, TicketParseError> =
     let rec loop i reader =
         match i >= count with
-        | true -> reader
-        | false -> loop (i + 1) (ccacheReadAddress reader)
+        | true -> reader |> Ok
+        | false ->
+            match ccacheReadAddress reader with
+            | Error e -> e |> Error
+            | Ok next -> loop (i + 1) next
     loop 0 r
 
 
 ///
 /// Skip N authdata records.
-let private ccacheSkipAuthData (count : int) (r : CcacheReader) : CcacheReader =
+let private ccacheSkipAuthData (count : int) (r : CcacheReader) : Result<CcacheReader, TicketParseError> =
     let rec loop i reader =
         match i >= count with
-        | true -> reader
-        | false -> loop (i + 1) (ccacheReadAuthData reader)
+        | true -> reader |> Ok
+        | false ->
+            match ccacheReadAuthData reader with
+            | Error e -> e |> Error
+            | Ok next -> loop (i + 1) next
     loop 0 r
 
 
-///
-/// After keyblock: skip timestamps, flags, addresses, authdata; return endtime + ticket + next reader.
-let private ccacheReadCredentialTail (r : CcacheReader) : uint32 * byte array * CcacheReader =
-    let _, r4 = ccacheReadUint32 r       // authtime
-    let _, r5 = ccacheReadUint32 r4      // starttime
-    let endTimeTs, r6 = ccacheReadUint32 r5
-    let _, r7 = ccacheReadUint32 r6      // renew_till
-    let _, r8 = ccacheReadByte r7        // is_skey
-    let _, r9 = ccacheReadUint32 r8      // tktflags
-    let numAddr, r10 = ccacheReadUint32 r9
-    let r11 = ccacheSkipAddresses (int numAddr) r10
-    let numAuthData, r12 = ccacheReadUint32 r11
-    let r13 = ccacheSkipAuthData (int numAuthData) r12
-    let ticketBytes, r14 = ccacheReadCountedOctetString r13
-    let _, r15 = ccacheReadCountedOctetString r14  // second_ticket
-    endTimeTs, ticketBytes, r15
+let private continueTail (read : CcacheReader -> Result<'a * CcacheReader, TicketParseError>) (update : CredentialTail -> 'a -> CcacheReader -> CredentialTail) (t : CredentialTail) : Result<CredentialTail, TicketParseError> =
+    match read t.reader with
+    | Error e -> e |> Error
+    | Ok (value, next) -> update t value next |> Ok
+
+
+let private skipAuthTime (t : CredentialTail) : Result<CredentialTail, TicketParseError> =
+    continueTail ccacheReadUint32 (fun cur _ next -> { cur with reader = next }) t
+
+
+let private skipStartTime (tail : Result<CredentialTail, TicketParseError>) : Result<CredentialTail, TicketParseError> =
+    match tail with
+    | Error e -> e |> Error
+    | Ok t -> continueTail ccacheReadUint32 (fun cur _ next -> { cur with reader = next }) t
+
+
+let private takeEndTime (tail : Result<CredentialTail, TicketParseError>) : Result<CredentialTail, TicketParseError> =
+    match tail with
+    | Error e -> e |> Error
+    | Ok t -> continueTail ccacheReadUint32 (fun cur ts next -> { cur with reader = next; endTimeTs = ts }) t
+
+
+let private skipRenewTill (tail : Result<CredentialTail, TicketParseError>) : Result<CredentialTail, TicketParseError> =
+    match tail with
+    | Error e -> e |> Error
+    | Ok t -> continueTail ccacheReadUint32 (fun cur _ next -> { cur with reader = next }) t
+
+
+let private skipIsSkey (tail : Result<CredentialTail, TicketParseError>) : Result<CredentialTail, TicketParseError> =
+    match tail with
+    | Error e -> e |> Error
+    | Ok t -> continueTail ccacheReadByte (fun cur _ next -> { cur with reader = next }) t
+
+
+let private skipTktFlags (tail : Result<CredentialTail, TicketParseError>) : Result<CredentialTail, TicketParseError> =
+    match tail with
+    | Error e -> e |> Error
+    | Ok t -> continueTail ccacheReadUint32 (fun cur _ next -> { cur with reader = next }) t
+
+
+let private addressesAfterCount (t : CredentialTail) (numAddr : uint32) (afterCount : CcacheReader) : Result<CredentialTail, TicketParseError> =
+    match ccacheSkipAddresses (int numAddr) afterCount with
+    | Error e -> e |> Error
+    | Ok next -> { t with reader = next } |> Ok
+
+
+let private addressCountOf (t : CredentialTail) : Result<CredentialTail, TicketParseError> =
+    match ccacheReadUint32 t.reader with
+    | Error e -> e |> Error
+    | Ok (numAddr, afterCount) -> addressesAfterCount t numAddr afterCount
+
+
+let private skipAddressList (tail : Result<CredentialTail, TicketParseError>) : Result<CredentialTail, TicketParseError> =
+    match tail with
+    | Error e -> e |> Error
+    | Ok t -> addressCountOf t
+
+
+let private authDataAfterCount (t : CredentialTail) (numAuthData : uint32) (afterCount : CcacheReader) : Result<CredentialTail, TicketParseError> =
+    match ccacheSkipAuthData (int numAuthData) afterCount with
+    | Error e -> e |> Error
+    | Ok next -> { t with reader = next } |> Ok
+
+
+let private authDataCountOf (t : CredentialTail) : Result<CredentialTail, TicketParseError> =
+    match ccacheReadUint32 t.reader with
+    | Error e -> e |> Error
+    | Ok (numAuthData, afterCount) -> authDataAfterCount t numAuthData afterCount
+
+
+let private skipAuthDataList (tail : Result<CredentialTail, TicketParseError>) : Result<CredentialTail, TicketParseError> =
+    match tail with
+    | Error e -> e |> Error
+    | Ok t -> authDataCountOf t
+
+
+let private takeTicketBytes (tail : Result<CredentialTail, TicketParseError>) : Result<CredentialTail, TicketParseError> =
+    match tail with
+    | Error e -> e |> Error
+    | Ok t -> continueTail ccacheReadCountedOctetString (fun cur bytes next -> { cur with reader = next; ticketBytes = bytes }) t
+
+
+let private skipSecondTicket (tail : Result<CredentialTail, TicketParseError>) : Result<CredentialTail, TicketParseError> =
+    match tail with
+    | Error e -> e |> Error
+    | Ok t -> continueTail ccacheReadCountedOctetString (fun cur _ next -> { cur with reader = next }) t
+
+
+let private startCredentialTail (r : CcacheReader) : Result<CredentialTail, TicketParseError> =
+    skipAuthTime
+        { reader = r
+          endTimeTs = 0u
+          ticketBytes = [||] }
+
+
+let private finishCredentialTail (tail : Result<CredentialTail, TicketParseError>) : Result<uint32 * byte array * CcacheReader, TicketParseError> =
+    match tail with
+    | Error e -> e |> Error
+    | Ok t -> (t.endTimeTs, t.ticketBytes, t.reader) |> Ok
+
+
+let private ccacheReadCredentialTail (r : CcacheReader) : Result<uint32 * byte array * CcacheReader, TicketParseError> =
+    r
+    |> startCredentialTail
+    |> skipStartTime
+    |> takeEndTime
+    |> skipRenewTill
+    |> skipIsSkey
+    |> skipTktFlags
+    |> skipAddressList
+    |> skipAuthDataList
+    |> takeTicketBytes
+    |> skipSecondTicket
+    |> finishCredentialTail
 
 
 ///
 /// Skip an entire config credential (X-CACHECONF) without materializing it.
-let private ccacheSkipConfigCredential (r : CcacheReader) : CcacheReader =
-    let _, r3 = ccacheReadKeyBlockV4 r
-    let _, _, r15 = ccacheReadCredentialTail r3
-    r15
+let private skipConfigAfterKey (r3 : CcacheReader) : Result<CcacheReader, TicketParseError> =
+    match ccacheReadCredentialTail r3 with
+    | Error e -> e |> Error
+    | Ok (_, _, r15) -> r15 |> Ok
 
 
-///
-/// Parsed credential from a .ccache file.
-type CcacheCredential =
-    { clientName : string list
-      clientRealm : string
-      serverName : string list
-      serverRealm : string
-      sessionKey : Key
-      endtime : DateTime option
-      ticketBytes : byte array }
+let private ccacheSkipConfigCredential (r : CcacheReader) : Result<CcacheReader, TicketParseError> =
+    match ccacheReadKeyBlockV4 r with
+    | Error e -> e |> Error
+    | Ok (_, r3) -> skipConfigAfterKey r3
 
 
 ///
@@ -479,37 +668,61 @@ let private unixTimestampToDateTime (ts : uint32) : DateTime option =
 
 ///
 /// Materialize one non-config credential from principals + remaining body.
-let private ccacheBuildCredential (clientName : string list) (clientRealm : string) (serverName : string list) (serverRealm : string) (r : CcacheReader) : CcacheCredential * CcacheReader =
-    let sessionKey, r3 = ccacheReadKeyBlockV4 r
-    let endTimeTs, ticketBytes, r15 = ccacheReadCredentialTail r3
-    let cred =
-        { clientName = clientName
-          clientRealm = clientRealm
-          serverName = serverName
-          serverRealm = serverRealm
-          sessionKey = sessionKey
-          endtime = unixTimestampToDateTime endTimeTs
-          ticketBytes = ticketBytes }
-    cred, r15
+let private credentialFromTail (principals : CcachePrincipals) (sessionKey : Key) (endTimeTs : uint32) (ticketBytes : byte array) (r15 : CcacheReader) : CcacheCredential * CcacheReader =
+    { CcacheCredential.clientName = principals.clientName
+      clientRealm = principals.clientRealm
+      serverName = principals.serverName
+      serverRealm = principals.serverRealm
+      sessionKey = sessionKey
+      endtime = unixTimestampToDateTime endTimeTs
+      ticketBytes = ticketBytes }, r15
+
+
+let private credentialAfterKey (principals : CcachePrincipals) (sessionKey : Key) (r3 : CcacheReader) : Result<CcacheCredential * CcacheReader, TicketParseError> =
+    match ccacheReadCredentialTail r3 with
+    | Error e -> e |> Error
+    | Ok (endTimeTs, ticketBytes, r15) ->
+        credentialFromTail principals sessionKey endTimeTs ticketBytes r15 |> Ok
+
+
+let private ccacheBuildCredential (principals : CcachePrincipals) (r : CcacheReader) : Result<CcacheCredential * CcacheReader, TicketParseError> =
+    match ccacheReadKeyBlockV4 r with
+    | Error e -> e |> Error
+    | Ok (sessionKey, r3) -> credentialAfterKey principals sessionKey r3
 
 
 ///
 /// Read one credential entry; None means stop (EOF / parse failure).
+let private credentialFromServer (principals : CcachePrincipals) (r2 : CcacheReader) : (CcacheCredential option * CcacheReader) option =
+    match principals.serverRealm with
+    | "X-CACHECONF:" ->
+        match ccacheSkipConfigCredential r2 with
+        | Error _ -> None
+        | Ok next -> Some (None, next)
+    | _ ->
+        match ccacheBuildCredential principals r2 with
+        | Error _ -> None
+        | Ok (cred, rNext) -> Some (Some cred, rNext)
+
+
+let private credentialAfterClient (clientName : string list) (clientRealm : string) (r1 : CcacheReader) : (CcacheCredential option * CcacheReader) option =
+    match ccacheReadPrincipal r1 with
+    | Error _ -> None
+    | Ok ((_, serverName, serverRealm), r2) ->
+        credentialFromServer
+            { CcachePrincipals.clientName = clientName
+              clientRealm = clientRealm
+              serverName = serverName
+              serverRealm = serverRealm } r2
+
+
 let private ccacheTryReadOneCredential (r : CcacheReader) : (CcacheCredential option * CcacheReader) option =
     match r.pos >= r.data.Length with
     | true -> None
     | false ->
-        try
-            let (_, clientName, clientRealm), r1 = ccacheReadPrincipal r
-            let (_, serverName, serverRealm), r2 = ccacheReadPrincipal r1
-            match serverRealm with
-            | "X-CACHECONF:" ->
-                Some (None, ccacheSkipConfigCredential r2)
-            | _ ->
-                let cred, rNext = ccacheBuildCredential clientName clientRealm serverName serverRealm r2
-                Some (Some cred, rNext)
-        with _ ->
-            None
+        match ccacheReadPrincipal r with
+        | Error _ -> None
+        | Ok ((_, clientName, clientRealm), r1) -> credentialAfterClient clientName clientRealm r1
 
 
 ///
@@ -530,42 +743,46 @@ let private ccacheSkipHeaders (remaining : int) (r : CcacheReader) : CcacheReade
         match left <= 0 || reader.pos + 4 > reader.data.Length with
         | true -> reader
         | false ->
-            let _, r' = ccacheReadUint16 reader
-            let taglen, r'' = ccacheReadUint16 r'
-            let r''' = { r'' with pos = r''.pos + int taglen }
-            loop (left - 4 - int taglen) r'''
+            let taglen = uint16 (int reader.data.[reader.pos + 2] <<< 8 ||| int reader.data.[reader.pos + 3])
+            loop (left - 4 - int taglen) { reader with pos = reader.pos + 4 + int taglen }
     loop remaining r
 
 
 ///
 /// Parse ccache v4 body after version bytes have been validated.
-let private parseCcacheV4Body (rawData : byte array) : Result<CcacheCredential, TicketParseError> =
-    let headerLen, _ = ccacheReadUint16 { data = rawData; pos = 2 }
-    let afterHeaders = ccacheSkipHeaders (int headerLen) { data = rawData; pos = 4 }
-    let _, afterPrincipal = ccacheReadPrincipal afterHeaders
+let private tgtFromCredentials (afterPrincipal : CcacheReader) : Result<CcacheCredential, TicketParseError> =
     match ccacheReadAllCredentials afterPrincipal with
     | [] -> InvalidCcacheFormat |> Error
     | credentials -> findTgtInCcache credentials
 
 
+let private credentialsAfterDefaultPrincipal (afterHeaders : CcacheReader) : Result<CcacheCredential, TicketParseError> =
+    match ccacheReadPrincipal afterHeaders with
+    | Error e -> e |> Error
+    | Ok (_, afterPrincipal) -> tgtFromCredentials afterPrincipal
+
+
+let private parseCcacheV4Body (rawData : byte array) : Result<CcacheCredential, TicketParseError> =
+    match ccacheReadUint16 { data = rawData; pos = 2 } with
+    | Error e -> e |> Error
+    | Ok (headerLen, _) ->
+        { data = rawData; pos = 4 }
+        |> ccacheSkipHeaders (int headerLen)
+        |> credentialsAfterDefaultPrincipal
+
+
+let private parseCcacheVersioned (rawData : byte array) : Result<CcacheCredential, TicketParseError> =
+    match rawData.[0], rawData.[1] with
+    | 0x05uy, 0x04uy -> parseCcacheV4Body rawData
+    | _ -> InvalidCcacheFormat |> Error
+
+
 ///
 /// Parse a .ccache file (MIT credential cache, version 4) and extract the TGT credential.
 let parseCcache (rawData : byte array) : Result<CcacheCredential, TicketParseError> =
-    try
-        match rawData.Length < 6 with
-        | true -> InvalidCcacheFormat |> Error
-        | false ->
-            match rawData.[0], rawData.[1] with
-            | 0x05uy, 0x04uy -> parseCcacheV4Body rawData
-            | _ -> InvalidCcacheFormat |> Error
-    with ex ->
-        ParseError ex.Message |> Error
-
-
-///
-/// Mutable byte buffer used only at the serialization edge.
-type private CcacheWriter =
-    { buffer : ResizeArray<byte> }
+    match rawData.Length < 6 with
+    | true -> InvalidCcacheFormat |> Error
+    | false -> parseCcacheVersioned rawData
 
 
 let private createCcacheWriter () : CcacheWriter =
@@ -679,6 +896,7 @@ let internal writeCcache (tgt : TgtResult) : byte array =
     let w = createCcacheWriter ()
     let crealm = defaultArg tgt.crealm "UNKNOWN"
     let principalName = defaultArg (List.tryHead (cnameComponentsFromTgt tgt)) "unknown"
+    
     writeCcacheHeader w
     writeSimplePrincipal w crealm principalName
     writeSimplePrincipal w crealm principalName
@@ -697,7 +915,7 @@ let internal writeCcache (tgt : TgtResult) : byte array =
 ///
 /// Convert a parsed KirbiCredInfo to a TgtResult for use with getServiceTicket.
 let private kirbiToTgtResult (cred : KirbiCredInfo) : TgtResult =
-    { ticketBytes = cred.ticketBytes
+    { TgtResult.ticketBytes = cred.ticketBytes
       sessionKey = cred.sessionKey
       sessionKeyType = int cred.sessionKey.enctype
       cname = None
@@ -708,7 +926,7 @@ let private kirbiToTgtResult (cred : KirbiCredInfo) : TgtResult =
 ///
 /// Convert a parsed CcacheCredential to a TgtResult for use with getServiceTicket.
 let private ccacheToTgtResult (cred : CcacheCredential) : TgtResult =
-    { ticketBytes = cred.ticketBytes
+    { TgtResult.ticketBytes = cred.ticketBytes
       sessionKey = cred.sessionKey
       sessionKeyType = int cred.sessionKey.enctype
       cname = None

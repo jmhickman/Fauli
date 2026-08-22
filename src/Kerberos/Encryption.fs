@@ -18,6 +18,25 @@ type public EncryptionType =
     | ARCFOUR_HMAC_MD5 = 23
 
 
+type public Key =
+    { enctype : EncryptionType
+      contents : byte array }
+
+
+type CryptoError =
+    | UnsupportedEncryptionType of EncryptionType
+    | CiphertextTooShort
+    | MacVerificationFailed
+    | PrfNotImplemented of EncryptionType
+
+
+type private Md4Reg =
+    { a : uint32
+      b : uint32
+      c : uint32
+      d : uint32 }
+
+
 module public KeyUsage =
     let AsReqPaEncTs = 1
     let KdcRepTicket = 2
@@ -31,18 +50,6 @@ module public KeyUsage =
     let ApReqAuthCksum = 10
     let ApReqAuth = 11
     let ApRepEncPart = 12
-
-
-type public Key = 
-    { enctype : EncryptionType
-      contents : byte array }
-
-
-type CryptoError =
-    | UnsupportedEncryptionType of EncryptionType
-    | CiphertextTooShort
-    | MacVerificationFailed
-    | PrfNotImplemented of EncryptionType
 
 
 let private concat2 (a : byte array) (b : byte array) : byte array =
@@ -445,13 +452,6 @@ let private rc4HmacMd5Decrypt (key : byte array) (keyUsage : int) (ciphertext : 
         let ke = keHmac.ComputeHash(cksum : byte array)
         rc4Crypt ke basicCtext
         |> tryRc4MacVerification ki keyUsage cksum
-
-
-type private Md4Reg =
-    { a : uint32
-      b : uint32
-      c : uint32
-      d : uint32 }
 
 
 let private leftRotate (x : uint32) (n : int) : uint32 =

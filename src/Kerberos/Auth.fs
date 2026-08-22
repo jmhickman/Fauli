@@ -11,6 +11,41 @@ open Fauli.Kerberos.Encryption
 open Fauli.Kerberos.Parsing
 
 
+type internal TgtResult =
+    { ticketBytes : byte array
+      sessionKey : Key
+      sessionKeyType : int
+      cname : BerValue option
+      crealm : string option
+      serverTime : DateTime option }
+
+
+///
+/// Private accumulating state for the AS exchange (TGT acquisition).
+/// Threaded through named pure steps to avoid deep nesting.
+type private AsExchange =
+    { kdcHost : string
+      username : string
+      password : string
+      realm : string
+      requestedEtype : EncryptionType option
+      initialResponse : byte array
+      preAuthNow : DateTime
+      supportedEtypes : (int * string option) list
+      preAuthResponse : byte array }
+
+
+///
+/// Result of a successful TGS-REQ/TGS-REP exchange.
+/// Contains the service ticket, its session key, and client identity for AP-REQ construction.
+type internal ServiceTicketResult =
+    { ticketBytes : byte array
+      sessionKey : Key
+      encPart : BerValue
+      cname : BerValue option
+      crealm : string option }
+
+
 ///
 /// KDC_ERR_PREAUTH_REQUIRED (25) — client must provide pre-authentication.
 let private krbPreauthRequired = 0x19
@@ -323,31 +358,6 @@ let internal buildPreauthAsReqForProver (username : string) (realm : string) (ke
     encodeAsReq kdcReq
 
 
-type internal TgtResult = 
-    { ticketBytes : byte array
-      sessionKey : Key
-      sessionKeyType : int
-      cname : BerValue option
-      crealm : string option
-      serverTime : DateTime option }
-
-
-///
-/// Private accumulating state for the AS exchange (TGT acquisition).
-/// Threaded through named pure steps to avoid deep nesting.
-/// 
-type private AsExchange =
-    { kdcHost : string
-      username : string
-      password : string
-      realm : string
-      requestedEtype : EncryptionType option
-      initialResponse : byte array
-      preAuthNow : DateTime
-      supportedEtypes : (int * string option) list
-      preAuthResponse : byte array }
-
-
 ///
 /// Match a preferred etype from the KDC's supported list.
 let private matchPreferredEtype (targetEtype : int) (targetEnum : EncryptionType) (supported : (int * string option) list) : (EncryptionType * string option) option =
@@ -481,7 +491,7 @@ let private extractTgtSessionKey (rep : BerValue) (etype : EncryptionType) (key 
                 match extractSessionKeyBytes (parseBer plain) encEtype, extractTicketBytes rep with
                 | None, _ | _, None -> KerberosTGTAcquisitionFailed |> Error
                 | Some sessionKey, Some ticketBytes ->
-                    { ticketBytes = ticketBytes
+                    { TgtResult.ticketBytes = ticketBytes
                       sessionKey = sessionKey
                       sessionKeyType = int sessionKey.enctype
                       cname = extractCname rep
@@ -763,18 +773,6 @@ let internal buildTgsReq (tgtTicket : byte array) (sessionKey : Key) (spn : stri
 
 
 ///
-/// Result of a successful TGS-REQ/TGS-REP exchange.
-/// Contains the service ticket, its session key, and client identity for AP-REQ construction.
-/// 
-type internal ServiceTicketResult = 
-    { ticketBytes : byte array
-      sessionKey : Key
-      encPart : BerValue
-      cname : BerValue option
-      crealm : string option }
-
-
-///
 /// Extract the per-service session key from EncTGSRepPart.
 let internal extractServiceKey
     (encTgsRepPart : BerValue)
@@ -843,7 +841,7 @@ let private completeServiceTicket (tgt : TgtResult) (rep : BerValue) (encTgsRepP
     match extractServiceKey encTgsRepPart, extractTicketBytes rep with
     | None, _ | _, None -> KerberosServiceTicketFailed |> Error
     | Some svcSessionKey, Some ticketBytes ->
-        { ticketBytes = ticketBytes
+        { ServiceTicketResult.ticketBytes = ticketBytes
           sessionKey = svcSessionKey
           encPart = encTgsRepPart
           cname = extractTgsCname encTgsRepPart |> Option.map Some |> Option.defaultValue tgt.cname
