@@ -41,6 +41,15 @@ let transformFlagEncrypted = 0x0001us
 
 
 ///
+/// Parsed SMB2 TRANSFORM_HEADER + ciphertext ([MS-SMB2] §2.2.41).
+type private TransformPacket =
+    { header : byte array
+      tag : byte array
+      nonce : byte array
+      ciphertext : byte array }
+
+
+///
 /// Map a negotiated CipherId to the domain cipher DU.
 let cipherFromId (cipherId : uint16) : SmbCipher option =
     match cipherId with
@@ -59,20 +68,51 @@ let cipherIdOf (cipher : SmbCipher) : uint16 =
     | Aes256Gcm -> cipherAes256Gcm
 
 
-let private isCcm (cipher : SmbCipher) : bool =
-    match cipher with
-    | Aes128Ccm | Aes256Ccm -> true
-    | Aes128Gcm | Aes256Gcm -> false
-
-
 let private nonceLength (cipher : SmbCipher) : int =
-    if isCcm cipher then 11 else 12
+    match cipher with
+    | Aes128Ccm | Aes256Ccm -> 11
+    | Aes128Gcm | Aes256Gcm -> 12
 
 
 let private keyBits (cipher : SmbCipher) : int =
     match cipher with
     | Aes128Ccm | Aes128Gcm -> 128
     | Aes256Ccm | Aes256Gcm -> 256
+
+
+let private asciiZ (s : string) : byte array =
+    Array.append (Encoding.ASCII.GetBytes s) [| 0uy |]
+
+
+let private sessionKeyMaterial (keyLen : int) (sessionKey : byte array) : byte array =
+    match sessionKey.Length >= keyLen, sessionKey.Length >= 16 with
+    | true, _ -> Array.sub sessionKey 0 keyLen
+    | false, true -> Array.sub sessionKey 0 16
+    | false, false -> sessionKey
+
+
+let private keysOfExpectedLength (keyLen : int) (fail : string) (encKey : byte array) (decKey : byte array) : Result<byte array * byte array, AuthError> =
+    match encKey.Length = keyLen && decKey.Length = keyLen with
+    | true -> (encKey, decKey) |> Ok
+    | false -> UnexpectedError fail |> Error
+
+
+let private smb311Keys (ki : byte array) (bits : int) (keyLen : int) (preauthHash : byte array option) : Result<byte array * byte array, AuthError> =
+    let context =
+        match preauthHash with
+        | Some h when h.Length = 64 -> h
+        | _ -> Array.zeroCreate 64
+    
+    keysOfExpectedLength keyLen "SMB 3.1.1 encryption KDF produced unexpected key length"
+        (kdfCounterMode ki (asciiZ "SMBC2SCipherKey") context bits)
+        (kdfCounterMode ki (asciiZ "SMBS2CCipherKey") context bits)
+
+
+let private smb30Keys (ki : byte array) (bits : int) (keyLen : int) : Result<byte array * byte array, AuthError> =
+    let label = asciiZ "SMB2AESCCM"
+    keysOfExpectedLength keyLen "SMB 3.0 encryption KDF produced unexpected key length"
+        (kdfCounterMode ki label (asciiZ "ServerIn ") bits)
+        (kdfCounterMode ki label (asciiZ "ServerOut") bits)
 
 
 ///
@@ -84,42 +124,31 @@ let private keyBits (cipher : SmbCipher) : int =
 /// SMB 3.1.1:
 ///   EncryptionKey = KDF(SessionKey, "SMBC2SCipherKey\0", PreauthHash, L)
 ///   DecryptionKey = KDF(SessionKey, "SMBS2CCipherKey\0", PreauthHash, L)
-/// 
-let deriveEncryptionKeys
-        (dialect : Dialect)
-        (sessionKey : byte array)
-        (cipher : SmbCipher)
-        (preauthHash : byte array option)
-        : Result<byte array * byte array, AuthError> =
+let deriveEncryptionKeys (dialect : Dialect) (sessionKey : byte array) (cipher : SmbCipher) (preauthHash : byte array option) : Result<byte array * byte array, AuthError> =
     let bits = keyBits cipher
     let keyLen = bits / 8
-    let ki =
-        if sessionKey.Length >= keyLen then Array.sub sessionKey 0 keyLen
-        elif sessionKey.Length >= 16 then Array.sub sessionKey 0 16
-        else sessionKey
+    let ki = sessionKeyMaterial keyLen sessionKey
     match dialect with
-    | SMB202 | SMB21 ->
-        UnexpectedError "SMB encryption requires SMB 3.x" |> Error
-    | SMB311 ->
-        let context =
-            match preauthHash with
-            | Some h when h.Length = 64 -> h
-            | _ -> Array.zeroCreate<byte> 64
-        let encLabel = Array.append (Encoding.ASCII.GetBytes "SMBC2SCipherKey") [| 0uy |]
-        let decLabel = Array.append (Encoding.ASCII.GetBytes "SMBS2CCipherKey") [| 0uy |]
-        let encKey = kdfCounterMode ki encLabel context bits
-        let decKey = kdfCounterMode ki decLabel context bits
-        if encKey.Length = keyLen && decKey.Length = keyLen then (encKey, decKey) |> Ok
-        else UnexpectedError "SMB 3.1.1 encryption KDF produced unexpected key length" |> Error
-    | SMB30 | SMB302 ->
-        let label = Array.append (Encoding.ASCII.GetBytes "SMB2AESCCM") [| 0uy |]
-        let encCtx = Array.append (Encoding.ASCII.GetBytes "ServerIn ") [| 0uy |]
-        let decCtx = Array.append (Encoding.ASCII.GetBytes "ServerOut") [| 0uy |]
-        let encKey = kdfCounterMode ki label encCtx bits
-        let decKey = kdfCounterMode ki label decCtx bits
-        
-        if encKey.Length = keyLen && decKey.Length = keyLen then (encKey, decKey) |> Ok
-        else UnexpectedError "SMB 3.0 encryption KDF produced unexpected key length" |> Error
+    | SMB202 | SMB21 -> UnexpectedError "SMB encryption requires SMB 3.x" |> Error
+    | SMB311 -> smb311Keys ki bits keyLen preauthHash
+    | SMB30 | SMB302 -> smb30Keys ki bits keyLen
+
+
+let private encryptionState (cipher : SmbCipher) (encKey : byte array, decKey : byte array) : SmbEncryption =
+    { Cipher = cipher
+      EncryptionKey = encKey
+      DecryptionKey = decKey }
+
+
+let private requireCipher (cipherId : uint16) : Result<SmbCipher, AuthError> =
+    match cipherFromId cipherId with
+    | Some cipher -> cipher |> Ok
+    | None -> UnexpectedError $"Unsupported SMB cipher id 0x{cipherId:X4}" |> Error
+
+
+let private deriveEncryption (dialect : Dialect) (sessionKey : byte array) (preauthHash : byte array option) (cipher : SmbCipher) : Result<SmbEncryption, AuthError> =
+    deriveEncryptionKeys dialect sessionKey cipher preauthHash
+    |> Result.map (encryptionState cipher)
 
 
 ///
@@ -128,17 +157,10 @@ let tryBuildEncryption (dialect : Dialect) (sessionKey : byte array) (cipherId :
     match encryptData with
     | false -> None |> Ok
     | true ->
-        match cipherFromId cipherId with
-        | None -> UnexpectedError $"Unsupported SMB cipher id 0x{cipherId:X4}" |> Error
-        | Some cipher ->
-            match deriveEncryptionKeys dialect sessionKey cipher preauthHash with
-            | Error e -> e |> Error
-            | Ok (encKey, decKey) ->
-                { Cipher = cipher
-                  EncryptionKey = encKey
-                  DecryptionKey = decKey } 
-                  |> Some
-                  |> Ok
+        cipherId
+        |> requireCipher
+        |> Result.bind (deriveEncryption dialect sessionKey preauthHash)
+        |> Result.map Some
 
 
 let private le16 (v : uint16) : byte array = BitConverter.GetBytes(v)
@@ -162,6 +184,7 @@ let private buildTransformHeaderSkeleton (nonce16 : byte array) (plainLen : int)
     Array.Copy(le32 (uint32 plainLen), 0, h, 36, 4)
     Array.Copy(le16 flagsOrAlg, 0, h, 42, 2)
     Array.Copy(le64 sessionId, 0, h, 44, 8)
+    
     h
 
 
@@ -189,6 +212,7 @@ let encryptSmbMessage (encryption : SmbEncryption) (sessionId : uint64) (plainSm
     let aad = transformAad header
     let ciphertext = Array.zeroCreate<byte> plainSmb2.Length
     let tag = Array.zeroCreate<byte> 16
+    
     match encryption.Cipher with
     | Aes128Ccm | Aes256Ccm ->
         use ccm = new AesCcm(encryption.EncryptionKey)
@@ -196,55 +220,70 @@ let encryptSmbMessage (encryption : SmbEncryption) (sessionId : uint64) (plainSm
     | Aes128Gcm | Aes256Gcm ->
         use gcm = new AesGcm(encryption.EncryptionKey, 16)
         gcm.Encrypt(nonce, plainSmb2, ciphertext, tag, aad)
+    
     Array.Copy(tag, 0, header, 4, 16)
     let packet = Array.zeroCreate<byte> (52 + ciphertext.Length)
     Array.Copy(header, 0, packet, 0, 52)
     Array.Copy(ciphertext, 0, packet, 52, ciphertext.Length)
+    
     packet
-
-
-///
-/// Decrypt a TRANSFORM_HEADER packet back to the plain SMB2 message.
-let decryptSmbMessage (encryption : SmbEncryption) (transformPacket : byte array) : Result<byte array, AuthError> =
-    try
-        if transformPacket.Length < 52 then
-            (UnexpectedError "SMB transform packet too short") |> Error
-        elif transformPacket.[0] <> Fauli.Constants.smbTransformHeaderMagic.[0] then
-            (UnexpectedError "Not an SMB2 TRANSFORM_HEADER") |> Error
-        else
-            let header = Array.sub transformPacket 0 52
-            let tag = Array.sub header 4 16
-            let nonce16 = Array.sub header 20 16
-            let originalSize = int (BitConverter.ToUInt32(header, 36))
-            let nLen = nonceLength encryption.Cipher
-            let nonce = Array.sub nonce16 0 nLen
-            let aad = transformAad header
-            let ciphertext =
-                if 52 + originalSize <= transformPacket.Length then
-                    Array.sub transformPacket 52 originalSize
-                else
-                    Array.sub transformPacket 52 (transformPacket.Length - 52)
-            let plain = Array.zeroCreate<byte> ciphertext.Length
-            match encryption.Cipher with
-            | Aes128Ccm | Aes256Ccm ->
-                use ccm = new AesCcm(encryption.DecryptionKey)
-                ccm.Decrypt(nonce, ciphertext, tag, plain, aad)
-            | Aes128Gcm | Aes256Gcm ->
-                use gcm = new AesGcm(encryption.DecryptionKey, 16)
-                gcm.Decrypt(nonce, ciphertext, tag, plain, aad)
-            plain |> Ok
-    with
-    | :? CryptographicException as ex ->
-        (UnexpectedError $"SMB decrypt failed: {ex.Message}") |> Error
-    | ex ->
-        (UnexpectedError $"SMB decrypt error: {ex.Message}") |> Error
 
 
 ///
 /// True when the NetBIOS payload is an encrypted transform (0xFD 'SMB').
 let isTransformPacket (data : byte array) : bool =
-    data.Length >= 4
-    && data.[0] = Fauli.Constants.smbTransformHeaderMagic.[0]
-    && data.[1] = 0x53uy
-    && data.[2] = 0x4Duy
-    && data.[3] = 0x42uy
+    match data.Length >= 4 with
+    | false -> false
+    | true -> Array.sub data 0 4 = Fauli.Constants.smbTransformHeaderMagic
+
+
+let private ciphertextSlice (packet : byte array) (originalSize : int) : byte array =
+    match 52 + originalSize <= packet.Length with
+    | true -> Array.sub packet 52 originalSize
+    | false -> Array.sub packet 52 (packet.Length - 52)
+
+
+let private parsedTransform (cipher : SmbCipher) (packet : byte array) : TransformPacket =
+    let header = Array.sub packet 0 52
+    { header = header
+      tag = Array.sub header 4 16
+      nonce = Array.sub header 20 (nonceLength cipher)
+      ciphertext = ciphertextSlice packet (int (BitConverter.ToUInt32(header, 36))) }
+
+
+let private transformFromLongPacket (cipher : SmbCipher) (packet : byte array) : Result<TransformPacket, AuthError> =
+    match isTransformPacket packet with
+    | false -> UnexpectedError "Not an SMB2 TRANSFORM_HEADER" |> Error
+    | true -> parsedTransform cipher packet |> Ok
+
+
+let private parseTransform (cipher : SmbCipher) (packet : byte array) : Result<TransformPacket, AuthError> =
+    match packet.Length < 52 with
+    | true -> UnexpectedError "SMB transform packet too short" |> Error
+    | false -> transformFromLongPacket cipher packet
+
+
+let private decryptCiphertext (encryption : SmbEncryption) (parsed : TransformPacket) : byte array =
+    let aad = transformAad parsed.header
+    let plain = Array.zeroCreate parsed.ciphertext.Length
+    match encryption.Cipher with
+    | Aes128Ccm | Aes256Ccm ->
+        use ccm = new AesCcm(encryption.DecryptionKey)
+        ccm.Decrypt(parsed.nonce, parsed.ciphertext, parsed.tag, plain, aad)
+    | Aes128Gcm | Aes256Gcm ->
+        use gcm = new AesGcm(encryption.DecryptionKey, 16)
+        gcm.Decrypt(parsed.nonce, parsed.ciphertext, parsed.tag, plain, aad)
+    
+    plain
+
+
+///
+/// Decrypt a TRANSFORM_HEADER packet back to the plain SMB2 message.
+/// AesCcm/AesGcm raise CryptographicException on tag mismatch (wrong key or tamper).
+let decryptSmbMessage (encryption : SmbEncryption) (transformPacket : byte array) : Result<byte array, AuthError> =
+    match parseTransform encryption.Cipher transformPacket with
+    | Error e -> e |> Error
+    | Ok parsed ->
+        try decryptCiphertext encryption parsed |> Ok
+        with
+        | :? CryptographicException as ex -> UnexpectedError $"SMB decrypt failed: {ex.Message}" |> Error
