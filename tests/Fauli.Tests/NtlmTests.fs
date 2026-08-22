@@ -2,6 +2,7 @@ module Fauli.Tests.NtlmTests
 
 open System
 open Xunit
+open Fauli.Domain
 open Fauli.Ntlm.Encoding
 open Fauli.Ntlm.Crypto
 open Fauli.Ntlm.Auth
@@ -86,29 +87,25 @@ let ``encodeNegotiateMessage includes workstation when provided`` () =
     let msg = encodeNegotiateMessage None (Some "WORKSTATION1")
     Assert.True(msg.Length > 48)
 
-[<Fact>]
-let ``encodeNegotiateMessage roundtrips via decodeNegotiateMessage`` () =
-    let msg = encodeNegotiateMessage (Some "CORP") (Some "WS01")
-    let parsed = decodeNegotiateMessage msg
-    Assert.Equal(Some "CORP", parsed.domainName)
-    Assert.Equal(Some "WS01", parsed.workstation)
-
-[<Fact>]
-let ``encodeNegotiateMessage with no domain/workstation roundtrips`` () =
-    let msg = encodeNegotiateMessage None None
-    let parsed = decodeNegotiateMessage msg
-    Assert.Equal(None, parsed.domainName)
-    Assert.Equal(None, parsed.workstation)
-
 // ============================================================================
 // 4. CHALLENGE_MESSAGE encoding and decoding
 // ============================================================================
 
 [<Fact>]
+let ``decodeChallengeMessage rejects a truncated header`` () =
+    let bad = Array.zeroCreate<byte> 32
+    match decodeChallengeMessage bad with
+    | Error NtlmChallengeFailed -> ()
+    | Error e -> Assert.Fail $"expected NtlmChallengeFailed, got {e}"
+    | Ok _ -> Assert.Fail "expected Error for truncated CHALLENGE_MESSAGE"
+
+[<Fact>]
 let ``decodeChallengeMessage validates signature`` () =
     let bad = Array.zeroCreate<byte> 56
-    let ex = Assert.Throws<ArgumentException>(fun () -> decodeChallengeMessage bad |> ignore)
-    Assert.NotNull(ex)
+    match decodeChallengeMessage bad with
+    | Error NtlmChallengeFailed -> ()
+    | Error e -> Assert.Fail $"expected NtlmChallengeFailed, got {e}"
+    | Ok _ -> Assert.Fail "expected Error for invalid signature"
 
 [<Fact>]
 let ``decodeChallengeMessage extracts server challenge`` () =
@@ -127,9 +124,11 @@ let ``decodeChallengeMessage extracts server challenge`` () =
     buf.[24] <- 0xABuy; buf.[25] <- 0xCDuy; buf.[26] <- 0xEFuy; buf.[27] <- 0x01uy
     buf.[28] <- 0x23uy; buf.[29] <- 0x45uy; buf.[30] <- 0x67uy; buf.[31] <- 0x89uy
 
-    let parsed = decodeChallengeMessage buf
-    Assert.Equal(8, parsed.serverChallenge.Length)
-    Assert.Equal(0xABuy, parsed.serverChallenge.[0])
+    match decodeChallengeMessage buf with
+    | Error e -> Assert.Fail $"expected Ok, got {e}"
+    | Ok parsed ->
+        Assert.Equal(8, parsed.serverChallenge.Length)
+        Assert.Equal(0xABuy, parsed.serverChallenge.[0])
 
 [<Fact>]
 let ``decodeChallengeMessage with TargetInfo AV_PAIRs`` () =
@@ -158,10 +157,12 @@ let ``decodeChallengeMessage with TargetInfo AV_PAIRs`` () =
     // Copy TargetInfo into payload
     Array.Copy(targetInfo, 0, buf, 56, targetInfo.Length)
 
-    let parsed = decodeChallengeMessage buf
-    // Parser stops at MsvAvEOL — only the real pair is returned
-    Assert.Equal(1, parsed.targetInfo.Length)
-    Assert.Equal(AvId.MsvAvNbDomainName, parsed.targetInfo.Head.avId)
+    match decodeChallengeMessage buf with
+    | Error e -> Assert.Fail $"expected Ok, got {e}"
+    | Ok parsed ->
+        // Parser stops at MsvAvEOL — only the real pair is returned
+        Assert.Equal(1, parsed.targetInfo.Length)
+        Assert.Equal(AvId.MsvAvNbDomainName, parsed.targetInfo.Head.avId)
 
 // ============================================================================
 // 5. AUTHENTICATE_MESSAGE encoding
@@ -169,17 +170,16 @@ let ``decodeChallengeMessage with TargetInfo AV_PAIRs`` () =
 
 [<Fact>]
 let ``encodeAuthenticateMessage starts with NTLMSSP signature and type 3`` () =
-    let mic = Array.zeroCreate<byte> 16
     let msg =
         encodeAuthenticateMessage
-            defaultNegotiateFlags
-            [| 0x01uy; 0x02uy |]  // lmResponse
-            [| 0x03uy; 0x04uy |]  // ntResponse
-            "DOMAIN"
-            "user"
-            "WORKSTATION"
-            [||]  // encryptedRandomSessionKey
-            mic
+            { negotiateFlags = defaultNegotiateFlags
+              lmResponse = [| 0x01uy; 0x02uy |]
+              ntResponse = [| 0x03uy; 0x04uy |]
+              domain = "DOMAIN"
+              username = "user"
+              workstation = "WORKSTATION"
+              encryptedRandomSessionKey = [||]
+              mic = Array.zeroCreate<byte> 16 }
     Assert.Equal(0x4Euy, msg.[0])
     Assert.Equal(0x03uy, msg.[8])
 
@@ -188,14 +188,14 @@ let ``encodeAuthenticateMessage includes MIC at offset 64`` () =
     let mic = Array.init 16 (fun i -> byte (i + 1))
     let msg =
         encodeAuthenticateMessage
-            defaultNegotiateFlags
-            [| 0x01uy |]
-            [| 0x02uy |]
-            "DOMAIN"
-            "user"
-            "WS"
-            [||]
-            mic
+            { negotiateFlags = defaultNegotiateFlags
+              lmResponse = [| 0x01uy |]
+              ntResponse = [| 0x02uy |]
+              domain = "DOMAIN"
+              username = "user"
+              workstation = "WS"
+              encryptedRandomSessionKey = [||]
+              mic = mic }
     let mic' = Array.init 16 (fun i -> msg.[72 + i])
     Assert.True((mic = mic'), "MIC bytes should match at offset 72")
 

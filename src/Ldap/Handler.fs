@@ -489,7 +489,7 @@ let private continueNtlmAfterType2 (stream : Stream) (password : string) (user :
     match type2Result with
     | Error e -> e |> Error
     | Ok type2Bytes ->
-        parseChallenge type2Bytes
+        decodeChallengeMessage type2Bytes
         |> completeNtlmLeg2 stream password user domain workstation type1 type2Bytes
 
 

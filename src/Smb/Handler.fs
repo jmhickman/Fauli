@@ -834,7 +834,7 @@ let private continueNtlmAfterType2 (state : SmbNegotiateState) (user : string) (
     match type2Bytes.Length < 32 with
     | true -> ProtocolAuthenticationRejected |> Error
     | false ->
-        match parseChallenge type2Bytes with
+        match decodeChallengeMessage type2Bytes with
         | Error e -> e |> Error
         | Ok challenge ->
             completeNtlmSessionAfterChallenge state user domain password workstation type1 type2Bytes sessionId1 req1 resp1 challenge

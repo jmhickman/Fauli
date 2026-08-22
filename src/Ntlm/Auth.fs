@@ -67,23 +67,6 @@ let internal buildNegotiateMessage (domain : string option) (workstation : strin
 
 
 ///
-/// Map challenge parse failures onto domain errors.
-let private mapChallengeParseException (ex : exn) : AuthError =
-    match ex with
-    | :? ArgumentException -> NtlmChallengeFailed
-    | _ -> UnexpectedError $"Failed to parse NTLM challenge: {ex.Message}"
-
-
-///
-/// Parse the server's CHALLENGE_MESSAGE (Type 2).
-let internal parseChallenge (data : byte array) : Result<ChallengeMessage, AuthError> =
-    try
-        decodeChallengeMessage data |> Ok
-    with ex ->
-        mapChallengeParseException ex |> Error
-
-
-///
 /// Default workstation label when none was supplied.
 let private defaultWorkstation (workstation : string option) : string =
     match workstation with
@@ -96,17 +79,16 @@ let private defaultWorkstation (workstation : string option) : string =
 ///
 /// Build the AUTHENTICATE_MESSAGE (Type 3) from the computed response.
 let internal buildAuthenticateMessage (negotiateFlags : uint32) (ntlmV2Resp : NtlmV2Response) (negotiateMsg : byte array) (challengeMsg : byte array) (domain : string) (username : string) (workstation : string) : byte array =
-    let micPlaceholder = Array.zeroCreate<byte> 16
     let authMsg =
         encodeAuthenticateMessage
-            negotiateFlags
-            ntlmV2Resp.lmResponse
-            ntlmV2Resp.ntResponse
-            domain
-            username
-            workstation
-            ntlmV2Resp.encryptedRandomSessionKey
-            micPlaceholder
+            { negotiateFlags = negotiateFlags
+              lmResponse = ntlmV2Resp.lmResponse
+              ntResponse = ntlmV2Resp.ntResponse
+              domain = domain
+              username = username
+              workstation = workstation
+              encryptedRandomSessionKey = ntlmV2Resp.encryptedRandomSessionKey
+              mic = Array.zeroCreate<byte> 16 }
     let mic = computeMic ntlmV2Resp.exportedSessionKey negotiateMsg challengeMsg authMsg
     Array.Copy(mic, 0, authMsg, 72, 16)
     
@@ -161,7 +143,7 @@ let internal authenticateWithNtlmV2 (client : TcpClient) (username : string) (pa
     let negotiateMsg = buildNegotiateMessage (Some domain) workstation
     try
         let challengeData = sendNtlmMessage client negotiateMsg
-        parseChallenge challengeData
+        decodeChallengeMessage challengeData
         |> continueAfterChallenge password username domain workstation negotiateMsg challengeData
     with ex ->
         mapNtlmTransportException ex |> Error

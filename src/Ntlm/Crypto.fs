@@ -51,33 +51,52 @@ let internal computeNtlmV2Hash (ntHash : byte array) (username : string) (domain
 
 
 ///
+/// FILETIME for the client blob: prefer the server's MsvAvTimestamp, else now.
+let private clientBlobTimestamp (serverTimestamp : DateTime option) : byte array =
+    match serverTimestamp with
+    | Some ts -> ts.ToFileTime()
+    | None -> DateTime.UtcNow.ToFileTime()
+    |> BitConverter.GetBytes
+
+
+///
+/// Drop EOL (re-emitted by encodeAvPairs) and any server MsvAvFlags we will replace.
+let private isRetainedAvPair (pair : AvPair) : bool =
+    pair.avId <> AvId.MsvAvEOL && pair.avId <> AvId.MsvAvFlags
+
+
+///
+/// MsvAvFlags = 0x00000002: authentication MIC is present ([MS-NLMP] §2.2.2.1).
+let private micPresentFlag : AvPair =
+    { avId = AvId.MsvAvFlags; value = BitConverter.GetBytes 0x00000002u }
+
+
+let private withMicPresentFlag (pairs : AvPair list) : AvPair list =
+    pairs @ [ micPresentFlag ]
+
+
+///
+/// TargetInfo for the client blob: server AV_PAIRs plus the MIC-present flag.
+let private clientAvPairs (targetInfo : AvPair list) : byte array =
+    targetInfo
+    |> List.filter isRetainedAvPair
+    |> withMicPresentFlag
+    |> encodeAvPairs
+
+
+///
 /// Build NTLMv2_CLIENT_CHALLENGE per [MS-NLMP] §2.2.2.7:
 /// RespType(1) HiRespType(1) Reserved1(2) Reserved2(4) TimeStamp(8)
 /// ChallengeFromClient(8) Reserved3(4) AvPairs (server TargetInfo + MIC flag).
 /// 
 let private buildClientBlob (clientChallenge : byte array) (targetInfo : AvPair list) (serverTimestamp : DateTime option) : byte array =
-    let sb = ResizeArray<byte>()
-    sb.Add 0x01uy 
-    sb.Add 0x01uy
-    
-    [1..6] |> List.iter (fun _ -> sb.Add 0x00uy)
-    let timestamp =
-        match serverTimestamp with
-        | Some ts -> ts.ToFileTime()
-        | None -> DateTime.UtcNow.ToFileTime()
-    BitConverter.GetBytes timestamp |> Array.iter sb.Add
-    clientChallenge |> Array.iter sb.Add
-    [1..4] |> List.iter (fun _ -> sb.Add 0x00uy)
-    
-    let micFlagValue = BitConverter.GetBytes 0x00000002u
-    let withoutFlags =
-        targetInfo
-        |> List.filter (fun p -> p.avId <> AvId.MsvAvEOL && p.avId <> AvId.MsvAvFlags)
-    let withMic =
-        withoutFlags @ [ { avId = AvId.MsvAvFlags; value = micFlagValue } ]
-    
-    encodeAvPairs withMic |> Array.iter sb.Add
-    sb.ToArray()
+    Array.concat
+        [ [| 0x01uy; 0x01uy |]
+          Array.zeroCreate 6
+          clientBlobTimestamp serverTimestamp
+          clientChallenge
+          Array.zeroCreate 4
+          clientAvPairs targetInfo ]
 
 
 ///
@@ -146,6 +165,7 @@ let private rc4 (key : byte array) (data : byte array) : byte array =
         s.[j] <- tmp
         let k = s.[(s.[i] + s.[j]) &&& 0xFF]
         out.[n] <- data.[n] ^^^ byte k
+    
     out
 
 

@@ -4,6 +4,8 @@ module internal Fauli.Ntlm.Encoding
 open System
 open System.Text
 
+open Fauli.Domain
+
 
 let private signature = Fauli.Constants.ntlmsspSignature  // "NTLMSSP\0"
 
@@ -17,6 +19,15 @@ let private ntLmChallenge = 0x00000002
 
 
 let private ntLmAuthenticate = 0x00000003
+
+
+let private authenticateHeaderLength = 88
+
+
+let private authenticateFlagsOffset = 60
+
+
+let private authenticateMicOffset = 72
 
 
 ///
@@ -104,9 +115,11 @@ let private readUint32Le (arr : byte array) (offset : int) : uint32 =
     (uint32 arr.[offset + 2] <<< 16) ||| (uint32 arr.[offset + 3] <<< 24)
 
 
-let private writeStringField (buffer : byte array) (fieldOffset : int) (payloadOffset : int) (strBytes : byte array) : unit = 
-    writeUint16Le buffer fieldOffset (uint16 strBytes.Length)
-    writeUint16Le buffer (fieldOffset + 2) (uint16 strBytes.Length)
+///
+/// Write an MS-NLMP security buffer (Len, MaxLen, BufferOffset).
+let private writeSecurityBuffer (buffer : byte array) (fieldOffset : int) (payloadOffset : int) (payload : byte array) : unit =
+    writeUint16Le buffer fieldOffset (uint16 payload.Length)
+    writeUint16Le buffer (fieldOffset + 2) (uint16 payload.Length)
     writeUint32Le buffer (fieldOffset + 4) (uint32 payloadOffset)
 
 
@@ -124,19 +137,20 @@ let private toOem (s : string) : byte array =
 
 ///
 /// Parse a sequence of AV_PAIR structures from the TargetInfo payload.
-let private parseAvPairs (data : byte array) (offset : int) (len : int) : AvPair list =
-    let buildAvPair data pos avId avLen =
-        { avId = avId; value = Array.sub data (pos + 4) avLen }
+let private parseAvPairs (data : byte array) (offset : int) (len : int) : Result<AvPair list, AuthError> =
+    let windowEnd = offset + len
     let rec loop pos acc =
-        match pos + 4 > offset + len with
-        | true -> List.rev acc
+        match pos + 4 > windowEnd with
+        | true -> List.rev acc |> Ok
         | false ->
             let avId = enum<AvId> (int (readUint16Le data pos))
             let avLen = int (readUint16Le data (pos + 2))
             match avId = AvId.MsvAvEOL with
-            | true -> List.rev acc
+            | true -> List.rev acc |> Ok
+            | false when avLen < 0 || pos + 4 + avLen > windowEnd ->
+                NtlmChallengeFailed |> Error
             | false ->
-                let pair = buildAvPair data pos avId avLen
+                let pair = { avId = avId; value = Array.sub data (pos + 4) avLen }
                 loop (pos + 4 + avLen) (pair :: acc)
     loop offset []
 
@@ -152,9 +166,8 @@ let internal encodeAvPairs (pairs : AvPair list) : byte array =
             let hdr = Array.zeroCreate<byte> 4
             writeUint16Le hdr 0 id
             writeUint16Le hdr 2 len
-            [ hdr; p.value ])
-    let eol = Array.zeroCreate<byte> 4  // MsvAvEOL id=0 len=0
-    Array.concat (parts @ [ eol ])
+            [ hdr; p.value ])  // MsvAvEOL id=0 len=0
+    Array.concat (parts @ [ Array.zeroCreate<byte> 4 ])
 
 
 ///
@@ -215,7 +228,7 @@ let internal encodeNegotiateMessage (domain : string option) (workstation : stri
     match domainBytes.Length > 0 with
     | true ->
         let domPayloadOffset = fixedSize
-        writeStringField buf 16 domPayloadOffset domainBytes
+        writeSecurityBuffer buf 16 domPayloadOffset domainBytes
     | false ->
         writeUint16Le buf 16 0us
         writeUint16Le buf 18 0us
@@ -224,7 +237,7 @@ let internal encodeNegotiateMessage (domain : string option) (workstation : stri
     match workstationBytes.Length > 0 with
     | true ->
         let wsPayloadOffset = fixedSize + domainBytes.Length
-        writeStringField buf 24 wsPayloadOffset workstationBytes
+        writeSecurityBuffer buf 24 wsPayloadOffset workstationBytes
     | false ->
         writeUint16Le buf 24 0us
         writeUint16Le buf 26 0us
@@ -252,138 +265,241 @@ type ChallengeMessage =
       targetInfo : AvPair list }
 
 
+type DecodeChallengeMessage = byte array -> Result<ChallengeMessage, AuthError>
+
+
 ///
-/// Parse a CHALLENGE_MESSAGE (Type 2) from raw bytes.
+/// Minimum CHALLENGE_MESSAGE size: TargetInfoFields occupy offsets 40–47 ([MS-NLMP] §2.2.1.2).
+let private challengeHeaderLength = 48
+
+
+///
 /// Decode a target name string from raw bytes using the negotiated encoding.
-/// 
 let private decodeTargetNameString (negotiateFlags : uint32) (bytes : byte array) : string =
     match negotiateFlags &&& uint32 NtlmFlags.NegotiateUnicode <> 0u with
     | true -> Encoding.Unicode.GetString bytes
     | false -> Encoding.Default.GetString bytes
 
 
-let internal decodeChallengeMessage (data : byte array) : ChallengeMessage =
-    match data.Length < 40 with
-    | true -> invalidArg "data" "CHALLENGE_MESSAGE too short"
-    | false -> ()
-    
-    match data.[0..7] <> signature with
-    | true -> invalidArg "data" "Invalid NTLMSSP signature"
-    | false -> ()
-    
-    match readUint32Le data 8 <> uint32 ntLmChallenge with
-    | true -> invalidArg "data" "Not a CHALLENGE_MESSAGE"
-    | false -> ()
-    
-    let targetNameLen = int (readUint16Le data 12)
-    let targetNameOffset = int (readUint32Le data 16)
-    let negotiateFlags = readUint32Le data 20
-    let serverChallenge = Array.sub data 24 8
-    let targetInfoLen = int (readUint16Le data 40)
-    let targetInfoOffset = int (readUint32Le data 44)
-    
-    let targetName =
-        match targetNameLen > 0 with
-        | true ->
-            let bytes = Array.sub data targetNameOffset targetNameLen
-            decodeTargetNameString negotiateFlags bytes |> Some
-        | false ->
-            None
-    
-    let targetInfo =
-        match targetInfoLen > 0 with
-        | true -> parseAvPairs data targetInfoOffset targetInfoLen
-        | false -> []
-    
-    { targetName = targetName
-      negotiateFlags = negotiateFlags
-      serverChallenge = serverChallenge
-      targetInfo = targetInfo }
+type private ChallengeParseState =
+    { data : byte array
+      negotiateFlags : uint32
+      serverChallenge : byte array
+      targetName : string option
+      targetInfo : AvPair list }
 
 
 ///
-/// Encode an AUTHENTICATE_MESSAGE (Type 3) for NetNTLMv2.
-/// EXAMINE This function takes too many parameters, breaks style prohibition
-let internal encodeAuthenticateMessage (negotiateFlags : uint32) (lmResponse : byte array) (ntResponse : byte array) (domain : string) (username : string) (workstation : string) (encryptedRandomSessionKey : byte array) (mic : byte array) : byte array =
-    let useUnicode = negotiateFlags &&& uint32 NtlmFlags.NegotiateUnicode <> 0u
-    let encodeString (s : string) : byte array =
-        match useUnicode with
-        | true -> toUtf16Le s
-        | false -> toOem s
+/// Reject a buffer that cannot hold the CHALLENGE_MESSAGE header.
+let private requireChallengeHeader (data : byte array) : Result<byte array, AuthError> =
+    match data.Length < challengeHeaderLength with
+    | true -> NtlmChallengeFailed |> Error
+    | false -> data |> Ok
+
+
+///
+/// Reject a buffer that does not start with the NTLMSSP signature.
+let private requireNtlmsspSignature (header : Result<byte array, AuthError>) : Result<byte array, AuthError> =
+    match header with
+    | Error e -> e |> Error
+    | Ok data ->
+        match data.[0..7] <> signature with
+        | true -> NtlmChallengeFailed |> Error
+        | false -> data |> Ok
+
+
+///
+/// Reject a buffer whose MessageType is not CHALLENGE_MESSAGE.
+let private requireChallengeMessageType (header : Result<byte array, AuthError>) : Result<byte array, AuthError> =
+    match header with
+    | Error e -> e |> Error
+    | Ok data ->
+        match readUint32Le data 8 <> uint32 ntLmChallenge with
+        | true -> NtlmChallengeFailed |> Error
+        | false -> data |> Ok
+
+
+///
+/// Slice a payload field, or fail when the declared offset/length overruns the buffer.
+let private trySlicePayload (data : byte array) (offset : int) (len : int) : Result<byte array, AuthError> =
+    match offset < 0 || len < 0 || offset > data.Length || len > data.Length - offset with
+    | true -> NtlmChallengeFailed |> Error
+    | false -> Array.sub data offset len |> Ok
+
+
+///
+/// Capture the fixed-size CHALLENGE_MESSAGE fields.
+let private readFixedChallengeFields (header : Result<byte array, AuthError>) : Result<ChallengeParseState, AuthError> =
+    match header with
+    | Error e -> e |> Error
+    | Ok data ->
+        { data = data
+          negotiateFlags = readUint32Le data 20
+          serverChallenge = Array.sub data 24 8
+          targetName = None
+          targetInfo = [] }
+        |> Ok
+
+
+///
+/// Decode a present TargetName security buffer into the parse state.
+let private targetNameFromSlice (state : ChallengeParseState) (slice : Result<byte array, AuthError>) : Result<ChallengeParseState, AuthError> =
+    match slice with
+    | Error e -> e |> Error
+    | Ok bytes ->
+        { state with targetName = decodeTargetNameString state.negotiateFlags bytes |> Some } |> Ok
+
+
+///
+/// Attach TargetName when the security buffer is present and in range.
+let private readTargetName (stateResult : Result<ChallengeParseState, AuthError>) : Result<ChallengeParseState, AuthError> =
+    match stateResult with
+    | Error e -> e |> Error
+    | Ok state ->
+        let len = int (readUint16Le state.data 12)
+        let offset = int (readUint32Le state.data 16)
+        
+        match len > 0 with
+        | false -> { state with targetName = None } |> Ok
+        | true -> trySlicePayload state.data offset len |> targetNameFromSlice state
+
+
+///
+/// Attach parsed AV_PAIRs to the parse state.
+let private targetInfoFromPairs (state : ChallengeParseState) (pairsResult : Result<AvPair list, AuthError>) : Result<ChallengeParseState, AuthError> =
+    match pairsResult with
+    | Error e -> e |> Error
+    | Ok pairs -> { state with targetInfo = pairs } |> Ok
+
+
+///
+/// Parse TargetInfo from a bounds-checked security buffer.
+let private parseSlicedTargetInfo (state : ChallengeParseState) (offset : int) (len : int) (slice : Result<byte array, AuthError>) : Result<ChallengeParseState, AuthError> =
+    match slice with
+    | Error e -> e |> Error
+    | Ok _ -> parseAvPairs state.data offset len |> targetInfoFromPairs state
+
+
+///
+/// Attach TargetInfo AV_PAIRs when the security buffer is present and in range.
+let private readTargetInfo (stateResult : Result<ChallengeParseState, AuthError>) : Result<ChallengeParseState, AuthError> =
+    match stateResult with
+    | Error e -> e |> Error
+    | Ok state ->
+        let len = int (readUint16Le state.data 40)
+        let offset = int (readUint32Le state.data 44)
+        
+        match len > 0 with
+        | false -> { state with targetInfo = [] } |> Ok
+        | true -> trySlicePayload state.data offset len |> parseSlicedTargetInfo state offset len
+
+
+///
+/// Project the parse state into the public CHALLENGE_MESSAGE record.
+let private finishChallengeMessage (stateResult : Result<ChallengeParseState, AuthError>) : Result<ChallengeMessage, AuthError> =
+    match stateResult with
+    | Error e -> e |> Error
+    | Ok state ->
+        { targetName = state.targetName
+          negotiateFlags = state.negotiateFlags
+          serverChallenge = state.serverChallenge
+          targetInfo = state.targetInfo }
+        |> Ok
+
+
+///
+/// Parse a CHALLENGE_MESSAGE (Type 2) from raw bytes.
+let internal decodeChallengeMessage : DecodeChallengeMessage = fun data ->
+    data
+    |> requireChallengeHeader
+    |> requireNtlmsspSignature
+    |> requireChallengeMessageType
+    |> readFixedChallengeFields
+    |> readTargetName
+    |> readTargetInfo
+    |> finishChallengeMessage
+
+
+///
+/// AUTHENTICATE_MESSAGE (Type 3) fields to encode.
+type AuthenticateMessage =
+    { negotiateFlags : uint32
+      lmResponse : byte array
+      ntResponse : byte array
+      domain : string
+      username : string
+      workstation : string
+      encryptedRandomSessionKey : byte array
+      mic : byte array }
+
+
+type EncodeAuthenticateMessage = AuthenticateMessage -> byte array
+
+
+///
+/// One Type-3 payload and the offset of its 8-byte security buffer ([MS-NLMP] §2.2.1.3).
+type private AuthenticateField =
+    { securityBufferOffset : int
+      payload : byte array }
+
+
+///
+/// Encode a string with the encoding implied by NegotiateUnicode.
+let private encodeAuthenticateString (negotiateFlags : uint32) (s : string) : byte array =
+    match negotiateFlags &&& uint32 NtlmFlags.NegotiateUnicode <> 0u with
+    | true -> toUtf16Le s
+    | false -> toOem s
+
+
+///
+/// Type-3 payloads in wire order: LmResponse, NtResponse, Domain, User, Workstation, SessionKey.
+let private authenticateFields (msg : AuthenticateMessage) : AuthenticateField list =
+    [ { securityBufferOffset = 12; payload = msg.lmResponse }
+      { securityBufferOffset = 20; payload = msg.ntResponse }
+      { securityBufferOffset = 28; payload = encodeAuthenticateString msg.negotiateFlags msg.domain }
+      { securityBufferOffset = 36; payload = encodeAuthenticateString msg.negotiateFlags msg.username }
+      { securityBufferOffset = 44; payload = encodeAuthenticateString msg.negotiateFlags msg.workstation }
+      { securityBufferOffset = 52; payload = msg.encryptedRandomSessionKey } ]
+
+
+let private payloadBytesLength (fields : AuthenticateField list) : int =
+    fields |> List.sumBy (fun field -> field.payload.Length)
+
+
+///
+/// Write one security buffer and its payload; return the next payload offset.
+let private writeAuthenticateField (buf : byte array) (payloadOffset : int) (field : AuthenticateField) : int =
+    writeSecurityBuffer buf field.securityBufferOffset payloadOffset field.payload
+    Array.Copy(field.payload, 0, buf, payloadOffset, field.payload.Length)
     
-    let domainBytes = encodeString domain
-    let userBytes = encodeString username
-    let wsBytes = encodeString workstation
-    let encKey = encryptedRandomSessionKey
-    let fixedSize = 88
-    let totalSize =
-        fixedSize + lmResponse.Length + ntResponse.Length + domainBytes.Length
-        + userBytes.Length + wsBytes.Length + encKey.Length
-    
-    let buf = Array.zeroCreate<byte> totalSize
+    payloadOffset + field.payload.Length
+
+
+///
+/// Write signature, MessageType, NegotiateFlags, and MIC.
+let private writeAuthenticateHeader (msg : AuthenticateMessage) (buf : byte array) : byte array =
     Array.Copy(signature, buf, 8)
     writeUint32Le buf 8 (uint32 ntLmAuthenticate)
-    let lmPayloadOffset = fixedSize
-    writeStringField buf 12 lmPayloadOffset lmResponse
-    let ntPayloadOffset = lmPayloadOffset + lmResponse.Length
-    writeStringField buf 20 ntPayloadOffset ntResponse
-    let domPayloadOffset = ntPayloadOffset + ntResponse.Length
-    writeStringField buf 28 domPayloadOffset domainBytes
-    let userPayloadOffset = domPayloadOffset + domainBytes.Length
-    writeStringField buf 36 userPayloadOffset userBytes
-    let wsPayloadOffset = userPayloadOffset + userBytes.Length
-    writeStringField buf 44 wsPayloadOffset wsBytes
-    let encPayloadOffset = wsPayloadOffset + wsBytes.Length
-    writeStringField buf 52 encPayloadOffset encKey
-    writeUint32Le buf 60 negotiateFlags
-    
-    Array.Copy(mic, 0, buf, 72, min 16 mic.Length)
-    Array.Copy(lmResponse, 0, buf, lmPayloadOffset, lmResponse.Length)
-    Array.Copy(ntResponse, 0, buf, ntPayloadOffset, ntResponse.Length)
-    Array.Copy(domainBytes, 0, buf, domPayloadOffset, domainBytes.Length)
-    Array.Copy(userBytes, 0, buf, userPayloadOffset, userBytes.Length)
-    Array.Copy(wsBytes, 0, buf, wsPayloadOffset, wsBytes.Length)
-    if encKey.Length > 0 then
-        Array.Copy(encKey, 0, buf, encPayloadOffset, encKey.Length)
+    writeUint32Le buf authenticateFlagsOffset msg.negotiateFlags
+    Array.Copy(msg.mic, 0, buf, authenticateMicOffset, min 16 msg.mic.Length)
     
     buf
 
 
 ///
-/// Parsed NEGOTIATE_MESSAGE fields.
-type NegotiateMessage =
-    { negotiateFlags : uint32
-      domainName : string option
-      workstation : string option }
+/// Lay out every Type-3 payload after the fixed header.
+let private writeAuthenticatePayloads (fields : AuthenticateField list) (buf : byte array) : byte array =
+    fields
+    |> List.fold (writeAuthenticateField buf) authenticateHeaderLength
+    |> ignore
+    
+    buf
 
 
 ///
-/// Parse a NEGOTIATE_MESSAGE (Type 1) from raw bytes.
-let internal decodeNegotiateMessage (data : byte array) : NegotiateMessage =
-    match data.Length < 32 with
-    | true -> invalidArg "data" "NEGOTIATE_MESSAGE too short"
-    | false -> ()
-    match data.[0..7] <> signature with
-    | true -> invalidArg "data" "Invalid NTLMSSP signature"
-    | false -> ()
-    match readUint32Le data 8 <> uint32 ntLmNegotiate with
-    | true -> invalidArg "data" "Not a NEGOTIATE_MESSAGE"
-    | false -> ()
-    
-    let negotiateFlags = readUint32Le data 12
-    let domainLen = int (readUint16Le data 16)
-    let domainOffset = int (readUint32Le data 20)
-    let wsLen = int (readUint16Le data 24)
-    let wsOffset = int (readUint32Le data 28)
-    let domainName =
-        match domainLen > 0 with
-        | true -> Encoding.Default.GetString(Array.sub data domainOffset domainLen) |> Some
-        | false -> None
-    let workstation =
-        match wsLen > 0 with
-        | true -> Encoding.Default.GetString(Array.sub data wsOffset wsLen) |> Some
-        | false -> None
-    
-    { negotiateFlags = negotiateFlags
-      domainName = domainName
-      workstation = workstation }
+/// Encode an AUTHENTICATE_MESSAGE (Type 3) for NetNTLMv2.
+let internal encodeAuthenticateMessage : EncodeAuthenticateMessage = fun msg ->
+    let fields = authenticateFields msg
+    Array.zeroCreate (authenticateHeaderLength + payloadBytesLength fields)
+    |> writeAuthenticateHeader msg
+    |> writeAuthenticatePayloads fields
