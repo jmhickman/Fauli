@@ -23,11 +23,13 @@ let private concat2 (a : byte array) (b : byte array) : byte array =
 let private concatMany (arrays : byte array array) : byte array =
     let totalLen = Array.sumBy Array.length arrays
     let result = Array.zeroCreate<byte> totalLen
+    
     let rec copyLoop idx offset =
         if idx < arrays.Length then
             Array.Copy(arrays.[idx], 0, result, offset, arrays.[idx].Length)
             copyLoop (idx + 1) (offset + arrays.[idx].Length)
     copyLoop 0 0
+    
     result
 
 
@@ -45,7 +47,7 @@ let internal computeNtlmV2Hash (ntHash : byte array) (username : string) (domain
         concat2
             (Encoding.Unicode.GetBytes (username.ToUpperInvariant()))
             (Encoding.Unicode.GetBytes domain)
-    hmac.ComputeHash(identity)
+    hmac.ComputeHash identity
 
 
 ///
@@ -158,8 +160,7 @@ let internal computeNtlmV2Response (password : string) (username : string) (doma
     rng.GetBytes clientChallenge 
     
     let clientBlob =
-        buildClientBlob clientChallenge challenge.targetInfo
-            (challenge.targetInfo |> extractTimestamp)
+        buildClientBlob clientChallenge challenge.targetInfo (challenge.targetInfo |> extractTimestamp)
     let ntProofStr = computeNtProofStr ntlmV2Hash challenge.serverChallenge clientBlob
     let ntResponse = computeNtV2Response ntlmV2Hash challenge.serverChallenge clientBlob
     let lmResponse = computeLmV2Response ntlmV2Hash challenge.serverChallenge clientChallenge
